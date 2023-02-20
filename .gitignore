@@ -1,0 +1,6 @@
+data/*
+pipeline/*
+log/*
+benchmark/*
+analysis/*/*.html
+.snakemake
