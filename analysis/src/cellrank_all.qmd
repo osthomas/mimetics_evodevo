@@ -1,0 +1,393 @@
+---
+title: scRNAseq - Cellrank
+subtitle: Variant "`r params$variant`"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    lightbox: true
+    fig-width: 6
+    fig-height: 4
+    dpi: 96
+params:
+  variant: NULL
+---
+
+
+```{r init, message = FALSE, warning = FALSE, results = "hide"}
+library(reticulate)
+reticulate::py_config()  # Required for proper initialization
+VARIANT <- params$variant
+if (!VARIANT %in% c("auto", "manual")) {
+    stop("Unknown variant: ", VARIANT)
+}
+```
+
+
+# Variants
+
+This analysis is run in two separate variants:
+
+1. *auto*: Automated identification of macrostates by Cellrank
+2. *manual*: Manual definition of terminal states to cover the majority of
+   mimetic populations
+
+This is the **`r VARIANT`** variant.
+
+
+```{r packages, message = FALSE, warning = FALSE, results = "hide"}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scran)
+library(scuttle)
+library(scater)
+library(patchwork)
+library(ComplexHeatmap)
+library(mimetics)
+FIGS <- file.path(ROOT, "analysis", "output", "figures", "sc_fate", VARIANT)
+dir.create(FIGS, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{python pyimport, warning = FALSE}
+from matplotlib import pyplot as  plt
+import pandas as pd
+import scanpy as sc
+import cellrank as cr
+from cellrank.estimators import GPCCA
+VARIANT = r.VARIANT
+```
+
+
+# Preprocessing
+
+We re-cluster the integrated data to investigate potentially spurious
+populations that may interfere with trajectory inference, without filtering on
+previously assigned labels.
+
+```{python}
+adata = sc.read("pipeline/integrated_all/sce_integrated_mimetics.h5ad")
+adata.layers[adata.uns["X_name"]] = adata.X.copy()
+adata.X = adata.layers["logcounts"]
+USE_REP = "fastMNN_all"
+
+sc.pp.neighbors(adata, use_rep = USE_REP, random_state = 0)
+# Do not rely on assigned labels, re-cluster
+sc.tl.leiden(adata, resolution = 2, flavor = "leidenalg")
+sc.pl.embedding(adata, "UMAP_int", color = "leiden", legend_loc = "on data")
+
+sc.pl.violin(adata, groupby = "leiden", keys = ["Pth", "Chga"])
+sc.pl.violin(adata, groupby = "leiden", keys = ["Cd3e", "Cd8a", "Cd4"])
+```
+
+* Clusters **19/20** express *Cd3/Cd4/Cd8*, likely T cells or nurse cells
+  contaminated with T cells
+* Cluster **32** expresses *Pth* and *Chga*, likely ectopic parathyroid tissue
+
+Remove these clusters.
+
+```{python remove-clusts}
+adata = adata[~adata.obs.leiden.isin(["19", "20", "32"])]
+sc.pl.embedding(adata, "UMAP_int", color = "leiden", legend_loc = "on data")
+```
+
+
+## Diffusion Pseudotime
+
+We choose the early progenitor with the highest AUC for the `early_progenitor`
+signature as the root cell for calculation of diffusion pseudotime (DPT).
+
+```{python dpt}
+early_progenitors = adata.obs.loc[(adata.obs["cell_type"] == "early_progenitor")]
+# Prefer embryonic early progenitors, if available
+if "embryo" in adata.obs["timepoint"].unique():
+    early_progenitors = early_progenitors[early_progenitors["timepoint"] == "embryo"]
+
+start = early_progenitors["auc"].idxmax()
+adata.uns["iroot"] = adata.obs.index.get_loc(start)  # for sc.tl.dpt
+sc.tl.diffmap(adata)  # diffmap uses the neighbors from sc.pp.neighbors, based on fastMNN
+sc.tl.dpt(adata)
+sc.pl.embedding(adata, "UMAP_int", color = "dpt_pseudotime")
+```
+
+
+## Identification of Macrostates
+
+Macrostates (initial, terminal or intermediate states) are selected with
+cellrank. We use a connectivity kernel and the pseudotime kernel based on DPT
+for directionality.
+
+We identify the number of macrostates based on the eigenvalues after
+Schur decomposition of the combined transition matrices.
+
+```{python macrostates, results = "hide"}
+pk = cr.kernels.PseudotimeKernel(adata, f"dpt_pseudotime")
+pk.compute_transition_matrix(show_progress_bar = False)
+ck = cr.kernels.ConnectivityKernel(adata)
+ck.compute_transition_matrix()
+g = GPCCA(0.5 * ck + 0.5 * pk)
+g.compute_schur()
+```
+
+```{python plot-macrostates}
+g.plot_spectrum(show_eigengap = False)
+g.fit(n_states = [10, 16], n_cells = 30)
+g.plot_macrostates("all", basis = "UMAP_int")
+```
+
+
+## Assignment of initial/terminal states
+
+We evaluate the identified macrostates based on their cell type compositions.
+The cell types are derived from prior analysis with `AUCell` or cluster label
+assignment in Nusser *et al.* (2022).
+
+```{python, results = "hide", fig.width = 8}
+g.plot_macrostate_composition("cell_type"); plt.show()
+state_map = {
+    "0": "Ciliated",
+    "1": "Microfold",
+    "2": "Skin",
+    "4": "Tuft",
+    "6": "Aire",
+    "7": "Neuroendocrine",
+    "8": "early_progenitor",
+    "10": "cTEC",
+}
+istates = ["8"]
+g.set_initial_states(istates)
+```
+
+
+<!-- This chunk only runs for VARIANT == "auto" -->
+```{python include = VARIANT == "auto", eval = VARIANT == "auto"}
+tstates = [x for x in state_map.keys() if x not in istates]
+g.set_terminal_states(tstates)
+# Convert to data frame for display
+state_df = pd.DataFrame(
+    [{"state": k, "name": v, "initial": k in istates, "terminal": k in tstates} for k, v in state_map.items()]
+)
+# Hide numerical index, which may be confused with the state ID
+state_df.index = [""] * len(state_df)
+state_df
+```
+
+<!-- This chunk only runs for VARIANT == "manual" -->
+```{r text, include = VARIANT == "manual", eval = VARIANT == "manual", results = "asis"}
+cat("Not all mimetic populations are represented by the identified macrostates.
+Therefore, we choose representative target cells based on the AUC for the
+relevant signatures.")
+```
+
+```{python manual-terminals, include = VARIANT == "manual", eval = VARIANT == "manual", results = "hide", fig.width = 10, fig.height = 8}
+not_terminal = adata.obs["cell_type"].str.contains("unassigned|postnatal_progenitor|early_progenitor|mTEC|cTEC_nurse")
+terminals = (
+    adata.obs.loc[~not_terminal]
+    # shuffle, then take head to "sample" up to X observations without
+    # replacement, even if the groups are smaller
+    .sample(frac = 1, random_state = 0)
+    .groupby("cell_type", observed = True)
+    # Sort by AUC and pick highest AUC cells as terminals.
+    # For populations without AUC, the order is random because of the shuffling
+    # above
+    .apply(lambda x: x.sort_values("auc", ascending = False).head(10))
+    .set_index("transcriptome")
+    .rename({"cell_type": "terminal"}, axis = 1)
+)
+
+# Plot terminals
+import math
+terms = terminals["terminal"].unique().astype(str)
+fig, ax = plt.subplots(math.ceil(len(terms) / 4), 4)
+for i, ax in enumerate(fig.axes):
+    if i < len(terms):
+        ax = sc.pl.embedding(adata, basis = "UMAP_int", ax = ax, show = False)
+        term_idx = terminals.index[terminals["terminal"] == terms[i]]
+        xy = adata[term_idx].obsm["UMAP_int"]
+        ax.scatter(xy[:, 0], xy[:, 1], s = 2, c = "red")
+        ax.set_title(terms[i])
+    ax.axis("off")
+fig.show()
+
+terminals = terminals[terminals["terminal"] != "Ionocyte"]
+terminals = terminals[terminals["terminal"] != "Goblet"]
+terminals = terminals["terminal"].astype(str)
+terminals = terminals.groupby(terminals).apply(lambda x: x.index.tolist()).to_dict()
+g.set_terminal_states(terminals)
+```
+
+```{r include = VARIANT == "manual", eval = VARIANT == "manual", results = "asis"}
+cat("Ionocytes and Goblets are ignored as terminals because they are rare and scattered.")
+```
+
+```{python fate-probs, results = "hide"}
+g.compute_fate_probabilities(show_progress_bar = False)
+res = pd.DataFrame(
+    data = g.fate_probabilities,
+    columns = g.fate_probabilities.names,
+    index = adata.obs.index)
+res = res.rename(state_map, axis = "columns")
+res = res.melt(
+    var_name = "fate",
+    value_name = "fate_probability",
+    ignore_index = False
+)
+res = res.merge(g.adata.obs["dpt_pseudotime"], left_index = True, right_index = True)
+res = res.reset_index(names = "transcriptome")
+res.to_csv("pipeline/cellrank_fps.csv", index = False)
+```
+
+
+# Fate Probabilities from CellRank
+
+```{r read-fps}
+sce <- readRDS(file.path(ROOT, "pipeline", "integrated_all", "sce_integrated_mimetics.rds"))
+if (interactive()) {
+    dat_long <- read.csv("pipeline/cellrank_fps.csv")
+} else {
+    dat_long <- py$res
+}
+dat_long <- dat_long %>%
+    left_join(makePerCellDF(sce, use.dimred = "UMAP_int"))
+dat_wide <- dat_long %>% pivot_wider(id_cols = transcriptome, names_from = "fate", values_from = "fate_probability")
+dat_wide <- left_join(dat_wide, distinct(select(dat_long, -fate, -fate_probability)))
+fp <- with(dat_long, xtabs(fate_probability ~ transcriptome + fate))
+N_FATES <- length(unique(dat_long$fate))
+```
+
+
+## Projection on integrated UMAP
+
+```{r fig_fate_labels, fig.height = 3, fig.width = 1.8}
+p_umap_pop <- ggplot(dat_wide, aes(UMAP_int.1, UMAP_int.2, color = label)) +
+    geom_point() +
+    scale_color_manual(
+        name = NULL,
+        limits = names(mimetics:::COL_POPULATION),
+        values = mimetics:::COL_POPULATION,
+        labels = as_labeller(mimetics:::LBL_SIGNATURE),
+        drop = FALSE
+    ) +
+    coord_fixed() +
+    mimetics:::theme_umap +
+    guides(color = guide_legend(override.aes = list(size = 2), nrow = 3))
+p_umap_pop
+fig_pdf(FIGS, p_umap_pop)
+```
+
+
+### Pseudotime
+
+```{r fig_fate_dpt, fig.height = 3, fig.width = 1.8}
+p_umap_dpt <- ggplot(dat_wide, aes(UMAP_int.1, UMAP_int.2, color = dpt_pseudotime)) +
+    geom_point() +
+    scale_color_viridis_c(name = "Diffusion Pseudotime", breaks = c(0, 0.5, 1)) +
+    coord_fixed() +
+    mimetics:::theme_umap +
+    theme(legend.title.position = "top", legend.title = element_text(hjust = 0.5))
+p_umap_dpt
+fig_pdf(FIGS, p_umap_dpt)
+```
+
+
+### Fate Probabilities
+
+```{r, fig.height = 8, fig.width = 8}
+ggplot(dat_long, aes(UMAP_int.1, UMAP_int.2, color = fate_probability)) +
+    geom_point(size = 1) +
+    facet_wrap(~fate)
+```
+
+
+## Individual Fate Probabilities
+
+
+```{r, fig.width = 10}
+Heatmap(
+    t(fp),
+    mimetics:::viridis_scale(0, 1),
+    name = "Scaled Fate Probabilities",
+    show_column_names = FALSE,
+    show_column_dend = FALSE,
+    column_title_gp = gpar(fontsize = 8),
+    column_title_rot = 90
+)
+```
+
+
+## Jaccard
+
+We set thresholds based on fate probabilities per cell and calculate the
+Jaccard index between cells for each fate that meet the threshold; at a fate
+probability over `X`, what fraction of cells is shared between fates?
+
+We have `r N_FATES` macrostates/fates, so a threshold of
+`r 1/N_FATES` is beyond equal probability for all states.
+
+```{r fig_fate_jaccard, fig.width = 6, fig.height = 2.8}
+#' Calculate pairwise Jaccard of a presence/absence matrix (boolean)
+jaccard <- function(mtx) {
+    isec <- crossprod(mtx)
+    uni <- nrow(mtx) - crossprod(!mtx)
+    isec / uni
+}
+
+# Calculate Jaccards for a range of fate probability thresholds
+fp_threshs <- seq(0, 1, by = 0.01)
+fp_jc <- vector("list", length(fp_threshs))
+for (i in seq_along(fp_threshs)) {
+    thresh <- fp_threshs[i]
+    jaccards <- jaccard(fp > thresh)
+    if (!(any(jaccards > 0 & jaccards < 1))) {
+        # skip uninformative thresholds (complete or no overlap)
+        break
+    }
+    df_ <- as.data.frame.table(jaccards)
+    colnames(df_) <- c("x", "y", "jaccard")
+    df_$thresh <- thresh
+    fp_jc[[i]] <- df_
+}
+fp_jc <- do.call(rbind, fp_jc)
+
+# For each pair, find the fate probability threshold above which the jaccard
+# drops below 1 / N_FATES
+fp_threshs <- fp_jc %>%
+    group_by(x, y) %>%
+    arrange(-jaccard) %>%
+    filter(jaccard <= 0.05) %>%
+    slice_head(n = 1)
+# Tabulate, cluster and extract order
+fp_hcl <- hclust(as.dist(xtabs(1 - thresh ~ x + y, data = fp_threshs)))
+# Use the same ordering for all threshold plots
+fp_jc$x <- factor(fp_jc$x, levels = fp_hcl$labels[fp_hcl$order])
+fp_jc$y <- factor(fp_jc$y, levels = levels(fp_jc$x))
+
+threshs <- switch(VARIANT,
+    auto = seq(0.1, 0.3, by = 0.1),
+    manual = seq(0.05, 0.15, by = 0.05)
+)
+p_fp_jc <- filter(fp_jc, thresh %in% threshs) %>%
+    ggplot(aes(x, y, fill = jaccard)) +
+    geom_tile() +
+    facet_wrap(~thresh, labeller = as_labeller(function(x) sprintf("FP > %s", x))) +
+    coord_fixed() +
+    scale_x_discrete(expand = c(0, 0)) +
+    scale_y_discrete(expand = c(0, 0)) +
+    scale_fill_viridis_c(
+        name = "Jaccard (cells over threshold)",
+        limits = c(0, 1),
+        breaks = c(0, 0.5, 1),
+        na.value = "gray80"
+    ) +
+    theme(
+        axis.title = element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+        legend.position = "bottom",
+        legend.title.position = "top",
+        legend.title = element_text(hjust = 0.5)
+    )
+p_fp_jc
+fig_pdf(FIGS, p_fp_jc)
+```

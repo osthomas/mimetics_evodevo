@@ -1,0 +1,68 @@
+import os
+
+# Rules to render (Rmarkdown/Quarto) reports
+include: "reports.smk"
+
+# Initial scRNAseq data and marker preparation
+include: "preparation.smk"
+
+# Bulk RNAseq analysis
+include: "bulk.smk"
+
+# scRNAseq analysis
+include: "scrnaseq.smk"
+
+# snRNAseq analysis
+include: "snrnaseq.smk"
+
+# FACS summary statistics analysis
+include: "facs.smk"
+
+rule all:
+    input:
+        "pipeline/figures.done",
+        "analysis/output/source_data.html"
+
+
+rule reports:
+    input:
+        "analysis/output/scrnaseq.html",
+        "analysis/output/barcodes_for_groups.html",
+        "analysis/output/bulk_rnaseq_limma.html",
+        "analysis/output/facs.html",
+        "analysis/output/sccoda.html",
+        "analysis/output/cellrank_manual.html",
+        "analysis/output/cellrank_auto.html",
+        "analysis/output/snrnaseq_analysis.html"
+    output:
+        touch("pipeline/reports.done")
+
+
+# Map output files to paper figures
+rule figures:
+    input:
+        "pipeline/reports.done",
+        tsv = "figures.tsv"
+    output:
+        touch("pipeline/figures.done")
+    run:
+        import os, shutil
+        import pandas as pd
+        tbl = pd.read_csv(input.tsv, sep = "\t")
+        for _, r in tbl.iterrows():
+            src = r["path_workflow"]
+            dst = r["path_paper"]
+            outdir = os.makedirs(os.path.dirname(dst), exist_ok = True)
+            shutil.copyfile(src, dst)
+
+
+# Collect source data
+use rule render_rmd as sourcedata with:
+    input:
+        "pipeline/reports.done",
+        "pipeline/figures.done",
+        **dict(rules.render_rmd.input),
+        rmd = "analysis/src/source_data.Rmd"
+    output:
+        html = "analysis/output/source_data.html",
+        outdir = directory("analysis/output/figures/paper/source_data")

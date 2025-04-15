@@ -1,0 +1,42 @@
+---
+title: Fetch Data
+date: "`r Sys.Date()`"
+---
+
+Fetch relevant data from ENSEMBL for local use.
+
+```{r}
+library(biomaRt)
+ensembl_mm <- useEnsembl(biomart = "genes", dataset = "mmusculus_gene_ensembl")
+ensembl_dr <- useEnsembl(biomart = "genes", dataset = "drerio_gene_ensembl")
+```
+```{r}
+ensembl_res_mm <- getBM(
+    attributes = c(
+        "ensembl_gene_id",
+        "drerio_homolog_ensembl_gene",
+        "drerio_homolog_orthology_confidence",
+        "drerio_homolog_orthology_type",
+        "drerio_homolog_associated_gene_name",
+        "external_gene_name"
+    ),
+    mart = ensembl_mm
+)
+
+ensembl_res_dr <- getBM(
+    attributes = c(
+        "ensembl_gene_id",
+        "mmusculus_homolog_ensembl_gene",
+        "mmusculus_homolog_associated_gene_name",
+        "external_gene_name"
+    ),
+    mart = ensembl_dr
+)
+
+# Make missing values explicit
+ensembl_res_mm[ensembl_res_mm == ""] <- NA
+ensembl_res_dr[ensembl_res_dr == ""] <- NA
+
+write.table(ensembl_res_mm, file.path(ROOT, "pipeline", "ensembl_genes_mm.tsv"), sep = "\t")
+write.table(ensembl_res_dr, file.path(ROOT, "pipeline", "ensembl_genes_dr.tsv"), sep = "\t")
+```

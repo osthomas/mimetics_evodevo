@@ -1,0 +1,156 @@
+---
+title: Filtering and consolidation of marker gene tables
+date: "`r Sys.Date()`"
+---
+
+```{r setup, message = FALSE}
+library(tidyverse)
+MARKERS_DIR <- file.path(ROOT, "data", "markers")
+```
+
+Michelson et al. have provided lists of differentially regulated genes in their
+clusters of mimetic populations vs. other cells (Supplementary Table S2). Here,
+these signature are used to identify corresponding mimetic cells in our dataset
+(Nusser et al. Nature 2022).
+
+
+# Filtering of Table S2
+
+```{r s2-filters}
+thresh_padj <- 1e-2
+thresh_log2fc <- 1
+thresh_pct1 <- 0.1
+```
+
+The differentially expressed genes for each mimetic population are filtered:
+
+* Adjusted p value <= `r thresh_padj`
+* log2 fold change >= `r thresh_log2fc`
+* Percent of cells expressing gene in cluster >= `r thresh_pct1 * 100`
+
+```{r markers-michelson}
+# Utilizing data from Michelson et al., Table S2
+mimetic_markers <- read.csv(file.path(MARKERS_DIR, "michelson_tbls2.csv")) %>%
+    filter(p.adj <= thresh_padj, avg_log2fc >= thresh_log2fc, pct1 >= thresh_pct1)
+```
+
+We also fetch data for signatures of TEC populations from Nusser et al., Tables
+S1 and S2.
+
+```{r markers-nusser}
+# Data from Nusser et al., Table S1 and S2
+tec_markers <- read.csv(file.path(MARKERS_DIR, "nusser_progenitor_signatures.csv"))
+```
+
+
+Combine TEC and mimetic markers and save as list.
+
+```{r combine}
+markers <- bind_rows(mimetic_markers, tec_markers) %>%
+    group_by(signature) %>%
+    summarize(gene = list(gene)) %>%
+    deframe()
+saveRDS(markers, file.path(ROOT, "pipeline", "markers.rds"))
+```
+
+
+Based on subsequent analysis (see identify_mimetics.Rmd), collapse similar
+signatures and restrict to mimetic populations of interest.
+
+```{r collapse}
+mimetic_markers_collapsed <- mimetic_markers %>%
+    mutate(
+        signature = ifelse(signature %in% c("Tuft1", "Tuft2"), "Tuft", signature),
+        signature = ifelse(signature %in% c("Skin_basal", "Skin_keratinized"), "Skin", signature)
+    )
+markers_collapsed <- bind_rows(mimetic_markers_collapsed, tec_markers) %>%
+    group_by(signature) %>%
+    summarize(gene = list(unique(gene))) %>%
+    deframe()
+saveRDS(markers_collapsed, file.path(ROOT, "pipeline", "markers_collapsed.rds"))
+
+
+# Restrict to mimetic signatures of interest
+signatures <- c("Ciliated", "Goblet", "Ionocyte", "Neuroendocrine", "Muscle", "Lung_basal", "EnteroHepato", "Pancreatic", "Microfold", "Skin", "Tuft", "Aire-stage")
+markers_mimetics_collapsed <- markers_collapsed[signatures]
+saveRDS(markers_mimetics_collapsed, file.path(ROOT, "pipeline", "markers_mimetics_collapsed.rds"))
+
+# Store a non-redundant set of genes that are specific to only one signature
+sigs_per_gene <- table(unlist(markers_mimetics_collapsed))
+unique_genes <- names(sigs_per_gene[sigs_per_gene == 1])
+markers_mimetics_collapsed_unique <- lapply(markers_mimetics_collapsed, function(x) {
+    intersect(x, unique_genes)
+})
+saveRDS(markers_mimetics_collapsed_unique, file.path(ROOT, "pipeline", "markers_mimetics_collapsed_unique.rds"))
+```
+
+
+Also store PanglaoDB markers for control purposes.
+
+```{r panglao}
+markers_panglao <- read.csv(file.path(MARKERS_DIR, "PanglaoDB_markers_27_Mar_2020.tsv"), sep = "\t") %>%
+    filter(
+        grepl("Mm", species),
+        gene.type == "protein-coding gene"
+    ) %>%
+    mutate(
+        signature = paste0("Panglao:", organ, ".", cell.type),
+        gene = stringr::str_to_title(official.gene.symbol)
+    ) %>%
+    group_by(signature) %>%
+    summarize(gene = list(unique(gene))) %>%
+    deframe()
+saveRDS(markers_panglao, file.path(ROOT, "pipeline", "markers_panglao.rds"))
+```
+
+
+And Tabula Muris signatures.
+
+```{r tmuris}
+read_tm_markers <- function(tissue, method) {
+    basedir <- file.path(MARKERS_DIR, "tabula_muris_markers")
+    f_classes <- file.path(basedir, paste(method, tissue, "cell_ontology_class", "classes.csv", sep = "_"))
+    f_markers <- file.path(basedir, paste(method, tissue, "cell_ontology_class", "markers.csv", sep = "_"))
+    classes <- read.csv(f_classes)
+    classes <- classes[, -1, drop = FALSE]
+    colnames(classes)[1] <- "cell_type"
+    classes$cluster <- 0:(nrow(classes) - 1)
+    markers <- read.csv(f_markers, row.names = NULL)
+    markers <- markers[, -1, drop = FALSE]
+    colnames(markers) <- c("p", "avg_log2fc", "pct1", "pct2", "p.adj", "cluster", "gene")
+    left_join(markers, classes) %>%
+        filter(!is.na(cell_type)) %>%
+        mutate(signature = paste0("TM:", tissue, ".", cell_type))
+}
+markers_tmuris <- bind_rows(
+    read_tm_markers("Bladder", "facs"),
+    read_tm_markers("Spleen", "facs"),
+    read_tm_markers("Kidney", "facs"),
+    read_tm_markers("Liver", "facs"),
+    read_tm_markers("Marrow", "facs"),
+    read_tm_markers("Muscle", "facs"),
+    read_tm_markers("Lung", "facs"),
+    read_tm_markers("Brain_Non-Myeloid", "facs")
+)
+
+markers_tmuris <- markers_tmuris %>%
+    filter(p.adj <= thresh_padj, avg_log2fc >= thresh_log2fc, pct1 >= thresh_pct1)
+
+markers_tmuris <- markers_tmuris %>%
+    group_by(signature) %>%
+    summarize(gene = list(gene)) %>%
+    deframe()
+saveRDS(markers_tmuris, file.path(ROOT, "pipeline", "markers_tmuris.rds"))
+```
+
+
+And MSigDB signatures.
+
+```{r msigdb}
+msigdb <- jsonlite::read_json(file.path(MARKERS_DIR, "msigdb_m8.all.v2023.2.Mm.json"))
+msigdb <- lapply(msigdb, function(x) unique(unlist(x$geneSymbols)))
+names(msigdb) <- paste("msigdb", names(msigdb), sep = ":")
+# omit Tabula Muris Senis (ageing) signatures
+msigdb <- msigdb[!grepl("TABULA_MURIS_SENIS", names(msigdb))]
+saveRDS(msigdb, file.path(ROOT, "pipeline", "markers_msigdb.rds"))
+```

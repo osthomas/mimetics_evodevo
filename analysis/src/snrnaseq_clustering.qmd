@@ -1,0 +1,208 @@
+---
+title: snRNAseq
+subtitle: Clustering
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    lightbox: true
+---
+
+
+```{r packages, message = FALSE, warning = FALSE, results = "hide", cache = FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(ComplexHeatmap)
+library(scran)
+library(scuttle)
+library(scater)
+library(bluster)
+devtools::load_all(file.path(ROOT, "R"))  # basically library(mimetics)
+```
+
+
+```{r sweepfuns}
+# Helper functions to process cluster sweeps
+
+#' Extract summary statistics from a `clusterSweep` result.
+summarize_clusterings <- function(indata, clusterings, FUN) {
+    clusterings <- as.list(clusterings)
+    wrapped <- function(clustering) FUN(indata, clustering)
+    result <- unlist(lapply(clusterings, wrapped))
+    result
+}
+
+
+mean_silhouette <- function(indata, clustering) {
+    if (length(unique(clustering)) > 1) {
+        mean(approxSilhouette(indata, clustering)$width)
+    } else {
+        NA
+    }
+}
+
+
+sum_wcss <- function(indata, clustering) {
+    sum(clusterRMSD(indata, clustering, sum = TRUE), na.rm = TRUE)
+}
+
+
+mean_wcss <- function(indata, clustering) {
+    mean(clusterRMSD(indata, clustering, sum = TRUE), na.rm = TRUE)
+}
+
+
+summarize_sweep <- function(cl_data, sweep_result) {
+    if (!"cluster.args" %in% colnames(sweep_result$parameters)) {
+        sweep_result$parameters$cluster.args <- list(NA)
+    }
+    parts <- list(
+        sweep_result$parameters,
+        do.call(rbind, lapply(sweep_result$parameters$cluster.args, as.data.frame))
+    )
+    out <- do.call(cbind, parts)
+    out$id <- as.character(seq_len(nrow(out)))
+    out$clusters <- lapply(as.list(sweep_result$clusters), function(x) {
+        x <- as.integer(as.character(x))
+        digits <- ceiling(log10(max(x)))
+        fmt <- sprintf("%%0%dd", digits)
+        x <- sprintf(fmt, x)
+        names(x) <- rownames(cl_data)
+        x
+    })
+    out$nclusters <- sapply(out$clusters, function(x) length(unique(x)))
+    out$silhouette <- summarize_clusterings(cl_data, out$clusters, mean_silhouette)
+    out$sum_wcss <- summarize_clusterings(cl_data, out$clusters, sum_wcss)
+    out$mean_wcss <- summarize_clusterings(cl_data, out$clusters, mean_wcss)
+    out$sil_sum_wcss_ratio <- out$silhouette / out$sum_wcss
+    out
+}
+
+
+```
+
+
+# Cluster Sweep 1
+
+Perform an initial cluster sweep using the `Leiden` algorithm with varying
+parameters.
+
+
+```{r warning = FALSE}
+sce <- readRDS(file.path(ROOT, "pipeline/snrnaseq_preproc.rds"))
+set.seed(81378)
+c1_data <- reducedDim(sce, "corrected")
+c1_sweep <- clusterSweep(
+    c1_data,
+    NNGraphParam(),
+    k = c(5L, 10L, 15L, 20L, 25L),
+    cluster.args = list(
+        resolution_parameter = c(0.2, 0.35, 0.5, 1, 2),
+        objective_function = "modularity"
+    ),
+    cluster.fun = "leiden",
+    BPPARAM = BiocParallel::MulticoreParam(8, RNGseed = 1)
+)
+c1_res <- summarize_sweep(c1_data, c1_sweep)
+```
+
+
+## Cluster Statistics
+
+```{r}
+p_sil <- ggplot(c1_res, aes(nclusters, silhouette)) +
+    geom_point() +
+    ggrepel::geom_text_repel(aes(label = sprintf("k=%d;res=%.2f", k, resolution_parameter)))
+p_sil
+```
+
+*Starting Point:* Leiden clustering with `k = 10` and `resolution = 0.2`.
+
+
+# Subcluster: Cluster Sweep 2
+
+Identify clusters for subclustering by investigating silhouette width.
+
+```{r, warning = FALSE}
+sce$c1 <- with(c1_res, clusters[[which(k == 10 & resolution_parameter == 0.2)]])
+sce$c1_sil <- approxSilhouette(c1_data, clusters = sce$c1)$width
+sce$c1_dosubcluster <- !(sce$c1 %in% c("01", "08", "11", "12"))
+ggplot(as_tibble(colData(sce)), aes(x = c1, y  = c1_sil, color = c1_dosubcluster)) +
+    ggbeeswarm::geom_quasirandom() +
+    theme(legend.position = c(1, 0), legend.justification.inside = c(1, 0)) +
+    plotReducedDim(sce, "UMAP", color = "c1", text_by = "c1")
+
+
+#' Subcluster groups of a SingleCellExperiment independently.
+#' @param x SingleCellExperiment
+#' @param groups A vector of the same length as `ncol(x)` specifying group
+#'      membership for subclustering
+subcluster <- function(x, groups) {
+    by_group <- split(seq_along(groups), groups)
+    results <- lapply(names(by_group), function(group) {
+        i <- by_group[[group]]
+        sce <- x[, i]
+        cl_data <- reducedDim(sce, "corrected")
+        res_sweep <- clusterSweep(
+            cl_data,
+            NNGraphParam(),
+            k = c(5L, 10L, 15L, 20L, 25L),
+            cluster.args = list(
+                resolution_parameter = c(0.2, 0.35, 0.5, 1, 2),
+                objective_function = "modularity"
+            ),
+            cluster.fun = "leiden"
+        )
+        dat_sweep <- summarize_sweep(cl_data, res_sweep)
+        dat_sweep$group <- group
+        dat_sweep
+    })
+    summaries <- do.call(rbind, results)
+    summaries
+}
+
+sce2 <- sce[, sce$c1_dosubcluster]
+set.seed(157283)
+c2_res <- as_tibble(subcluster(sce2, as.character(sce2$c1)))
+c2_res <- c2_res %>%
+    group_by(group) %>%
+    mutate(order = rank(sil_sum_wcss_ratio))
+```
+
+
+Select cluster parameters for each subclustering by inspection of the total
+within cluster sum of squares (`sum_wcss`) and mean silhouette width
+(`silhouette`) over all subclusters.
+
+```{r}
+ggplot(as.data.frame(c2_res), aes(silhouette, sum_wcss, color = factor(k))) +
+    geom_point() +
+    ggrepel::geom_text_repel(aes(label = sprintf("res=%.2f", resolution_parameter)), max.overlaps = Inf) +
+    facet_wrap(~group, scales = "free")
+c2_selected <- with(c2_res, c(
+    clusters[[which(group == "02" & k == 25 & resolution_parameter == 0.2)]],
+    clusters[[which(group == "03" & k == 25 & resolution_parameter == 0.35)]],
+    clusters[[which(group == "04" & k == 5 & resolution_parameter == 0.2)]],
+    clusters[[which(group == "05" & k == 15 & resolution_parameter == 0.2)]],
+    clusters[[which(group == "06" & k == 10 & resolution_parameter == 0.2)]],
+    clusters[[which(group == "07" & k == 5 & resolution_parameter == 0.35)]],
+    clusters[[which(group == "09" & k == 20 & resolution_parameter == 0.2)]],
+    clusters[[which(group == "10" & k == 15 & resolution_parameter == 0.2)]]
+))
+sce$c2 <- NA
+colData(sce)[match(names(c2_selected), colnames(sce)), "c2"] <- c2_selected
+sce$c2 <- ifelse(is.na(sce$c2), sce$c1, paste(sce$c1, sce$c2, sep = "."))
+sce$c2_sil <- approxSilhouette(c1_data, clusters = sce$c2)$width
+ggplot(as_tibble(colData(sce)), aes(x = c2, y  = c2_sil)) +
+    ggbeeswarm::geom_quasirandom() +
+plotReducedDim(sce, "UMAP", color = "c2", text_by = "c2") + scale_color_manual(values = sample(rainbow(length(unique(sce$c2)))))
+
+# Final clustering
+sce$cluster <- sce$c2
+# Save results
+saveRDS(sce, file.path(ROOT, "pipeline/snrnaseq_clustering.rds"))
+```

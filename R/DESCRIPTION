@@ -1,0 +1,9 @@
+Package: mimetics
+Type: Package
+Title: Mimetic Cells Analysis
+Version: 1.0
+Date: 2024
+Author: Oliver Thomas
+Maintainer: Oliver Thomas <thomaso@ie-freiburg.mpg.de>
+Description: This package collects functions and parameters that are reused in multiple analyses and reports. It also sets common plot settings.
+RoxygenNote: 7.3.2

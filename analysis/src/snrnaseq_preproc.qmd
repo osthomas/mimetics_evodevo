@@ -1,0 +1,385 @@
+---
+title: snRNAseq
+subtitle: QC and Preprocessing
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    lightbox: true
+---
+
+
+```{r packages, message = FALSE, warning = FALSE, results = "hide", cache = FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scran)
+library(scuttle)
+library(scater)
+library(patchwork)
+library(scDblFinder)
+devtools::load_all(file.path(ROOT, "R"))  # basically library(mimetics)
+
+meta_sn <- read.csv(file.path(ROOT, "data/snrnaseq/metadata.tsv"), sep = "\t")
+read_sce_from_df <- function(df, h5_col) {
+    do.call(cbind, apply(df, 1, function(row) {
+        sce <- read_h5(row[h5_col])
+        mt_genes <- grepl("^mt-", rownames(sce), ignore.case = TRUE)
+        qc <- perCellQCMetrics(sce, subsets = list(mito = mt_genes))
+        qc$complexity <- qc$detected / qc$sum
+        qc$sum_rank <- rank(-qc$sum)
+        colData(sce) <- cbind(colData(sce), qc)
+        meta_cols <- grep("_h5$|^(r1|r2)$", names(row), invert = TRUE, value = TRUE) # remove path columns
+        for (cname in meta_cols) {
+            colData(sce)[cname] <- row[cname]
+        }
+        # Endow barcodes with sample name
+        colnames(sce) <- paste0(sce$sample, ".", colnames(sce))
+        sce
+    }))
+}
+```
+
+
+# Raw Data: CellRanger
+
+```{r cellranger}
+sce_cellranger <- read_sce_from_df(meta_sn, "cellranger_filtered_h5")
+```
+
+
+## Barcode-Rank Plot
+
+There were excessive numbers of detected cells by the initial CellRanger run,
+particularly in one nude sample (upwards of 140,000 cells).
+
+```{r cellranger-kneeplot, fig.width = 6, fig.height = 3}
+ggcells(sce_cellranger, aes(sum_rank, sum)) +
+    geom_point() +
+    scale_x_log10() +
+    scale_y_log10() +
+    facet_wrap(~sample)
+table(sce_cellranger$sample)
+```
+
+
+## Mitochondrial Content
+
+Mitochondrial gene content is unexpectedly high for a single nucleus
+experiment, suggesting contamination with ambient RNA.
+
+```{r cellranger-mito}
+ggcells(sce_cellranger, aes(sample, subsets_mito_percent)) +
+    geom_violin()
+with(colData(sce_cellranger),
+    aggregate(subsets_mito_percent ~ sample, FUN = summary)
+)
+```
+
+```{r}
+# # no longer needed
+rm(sce_cellranger)
+```
+
+
+# Raw Data: CellBender
+
+Background signal was reduced by running the raw CellRanger output through
+CellBender. CellBender output is further processed and analysed here.
+
+```{r read}
+# Filtered here refers to filtered by CellBender, not by additional QC
+DATA <- file.path(ROOT, "data/snrnaseq/cellbender")
+meta_sn$cellbender_filtered_h5 <- file.path(DATA, paste0(meta_sn$sample, "_filtered.h5"))
+sce_unfilt <- read_sce_from_df(meta_sn, "cellbender_filtered_h5")
+```
+
+
+## QC and Filtering
+
+There were excessive numbers of detected cells by the initial CellRanger run,
+particularly in one nude sample (upwards of 140,000 cells). Cellbender has
+brought this down to more reasonable levels.
+
+```{r}
+table(sce_unfilt$sample)
+```
+
+Nevertheless, these numbers are still above the expected number of cells based
+on the utilized chemistry (20,000).
+
+Filtering is performed based on the total reads per cell, the number of
+detected genes, and the mitochondrial content. Thresholds are determined based
+on the *het* (non-nude) samples because they are less prone to artifacts
+resulting from (laboratory) sample processing, as their thymi are easier to
+explant than nude cysts.
+
+The *shaded areas* indicate nuclei that pass filters and are *retained*.
+
+```{r qc-calc}
+# Set thresholds based on het samples and apply to nudes
+qc <- colData(sce_unfilt)[c("sum", "detected", "complexity", "subsets_mito_percent")]
+qc_subset <- sce_unfilt$condition == "Foxn1het"
+filters <- list(
+    sum = isOutlier(qc$sum, type = "lower", log = TRUE, subset = qc_subset, nmads = 1),
+    detected = isOutlier(qc$detected, type = "lower", log = TRUE, subset = qc_subset, nmads = 1),
+    complexity = isOutlier(qc$complexity, type = "both", log = TRUE, subset = qc_subset, nmads = 3),
+    subsets_mito_percent = isOutlier(qc$subsets_mito_percent, type = "higher", log = FALSE, subset = qc_subset, nmads = 3)
+)
+filters <- as.data.frame(sapply(filters, function(x) attr(x, "thresholds")))
+```
+
+```{r qc-umiknee, fig.width = 6, fig.height = 3}
+QC_MIN_READS <- 500
+QC_MAX_MITO_PRC <- 5
+ggcells(sce_unfilt, aes(sum_rank, sum, color = subsets_mito_percent)) +
+    geom_point() +
+    scale_x_log10() +
+    scale_y_log10() +
+    geom_hline(yintercept = QC_MIN_READS) +
+    facet_wrap(~sample)
+```
+
+There are sudden drops in the UMI-rank plots, which correlates with an increase
+in high mitochondrial read proportions in some droplets. Based on this, enforce
+a lower count limit of `r QC_MIN_READS` and an upper mitochondrial counts limit
+of `r QC_MAX_MITO_PRC`%.
+
+```{r qc-filters}
+# Enforce some lower limits
+filters["lower", "sum"] <- QC_MIN_READS
+filters["higher", "subsets_mito_percent"] <- QC_MAX_MITO_PRC
+# filters["lower", "detected"] <- 100
+sce_unfilt$discard <- Reduce("|", lapply(colnames(filters), function(metric) {
+    low <- filters["lower", metric]
+    high <- filters["higher", metric]
+    qc[[metric]] < low | qc[[metric]] > high
+}))
+table(sce_unfilt$discard, sce_unfilt$sample)
+```
+
+```{r qc-plot, fig.width = 8, fig.height = 2}
+p_qc_vio <- ggcells(sce_unfilt, aes(sample)) +
+    geom_blank() +
+    geom_rect(
+        data = filters,
+        fill = "#00880011", color = "transparent",
+        xmin = -Inf, xmax = Inf,
+        aes(x = NULL, ymin = min(after_stat(y)), ymax = max(after_stat(y)))
+    ) +
+    geom_violin()
+wrap_plots(
+    p_qc_vio + aes(y = sum) + scale_y_log10() + labs(title = "Total UMIs"),
+    p_qc_vio + aes(y = detected) + scale_y_log10() + labs(title = "Detected Genes"),
+    p_qc_vio + aes(y = complexity) + labs(title = "Complexity (Detected / UMIs)"),
+    p_qc_vio + aes(y = subsets_mito_percent) + labs(title = "% mitochondrial counts"),
+    ncol = 5
+)
+
+sce <- sce_unfilt[, !sce_unfilt$discard]
+```
+
+
+# Initial Dimensionality Reduction for Overview
+
+```{r pp-dimred}
+set.seed(12345)
+sce$quick_cluster <- quickCluster(sce, graph.fun = "louvain", block = sce$sample, block.BPPARAM = BiocParallel::MulticoreParam(8))
+sce <- computeSumFactors(sce, clusters = sce$quick_cluster, BPPARAM = BiocParallel::MulticoreParam(8))
+sce <- logNormCounts(sce)
+sce <- runPCA(sce, subset_row = getTopHVGs(modelGeneVar(sce, block = sce$sample)), name = "pp_PCA")
+sce <- runUMAP(sce, dimred = "pp_PCA", name = "pp_UMAP", n_neighbors = 10)
+```
+
+The presence of several hematopoietic marker genes (Ptprc = Cd45, Cd3e, Cd4,
+Cd8a) in the large dominant "blob" in the het UMAP indicates that these are
+thymocytes that were not exhaustively removed by the initial tissue processing.
+This population is completely absent in the nudes. Adipocytes (Ppara, Pparg)
+are dominant in the nudes.
+
+Some cells in this thymocyte population express Foxn1. Conversely, several
+cells in the Epcam/Foxn1 positive population express Ptprc. This suggests that
+some contamination between cells may have occurred.
+
+```{r qc_umaps, fig.height = 2, cache = FALSE}
+qc_umap <- function(sce, dimred, marker, ...) {
+    dat <- scuttle::makePerCellDF(sce, use.dimred = dimred, features = marker, ...)
+    dat <- arrange(dat, .data[[marker]])
+    xvar <- paste0(dimred, ".1")
+    yvar <- paste0(dimred, ".2")
+    ggplot(dat, aes(.data[[xvar]], .data[[yvar]], color = .data[[marker]])) +
+        geom_point(size = 0.5) +
+        facet_wrap(~sample, ncol = 6) +
+        scale_color_gradient(low = "gray", high = "red")
+}
+ggcells(sce, aes(pp_UMAP.1, pp_UMAP.2, color = sample)) +
+    geom_point(size = 0.1) +
+    facet_wrap(~sample, ncol = 6)
+qc_umap(sce, "pp_UMAP", "Ptprc")
+qc_umap(sce, "pp_UMAP", "Foxn1")
+qc_umap(sce, "pp_UMAP", "Epcam")
+qc_umap(sce, "pp_UMAP", "Ppara")
+qc_umap(sce, "pp_UMAP", "Pparg")
+```
+
+
+# Doublet Detection
+
+Use `scDblFinder` to detect doublets and remove them from the dataset.
+
+```{r scdblfinder}
+set.seed(12345)
+sce <- scDblFinder(sce, clusters = sce$quick_cluster, samples = sce$sample,
+    BPPARAM = BiocParallel::MulticoreParam(workers = 4)
+)
+table(sce$sample, sce$scDblFinder.class)
+ggcells(sce, aes(pp_UMAP.1, pp_UMAP.2, color = scDblFinder.class)) +
+    geom_point(data = ~sample_frac(., 1), size = 0.5) +
+    facet_wrap(~sample)
+sce <- sce[, sce$scDblFinder.class == "singlet"]
+```
+
+
+# Run AUCell
+
+```{r aucgenes}
+MIN_COUNT <- 1
+MIN_CELLS <- 3
+auc_genes <- rowSums(counts(sce) >= MIN_COUNT) >= MIN_CELLS
+```
+
+For AUCell, trim the count matrix by removing extremely lowly expressed genes.
+
+Genes are kept if:
+
+* they have a count of at least `r MIN_COUNT` in
+* at least `r MIN_CELLS` cells
+
+Numbers:
+
+* `r sum(auc_genes)` kept
+* `r sum(!auc_genes)` removed
+
+```{r aucell, warning = FALSE}
+markers <- read.delim(file.path(ROOT, "analysis/output/figures/bulk/tbl_markers.tsv")) %>%
+    group_by(signature) %>%
+    summarize(set = list(gene)) %>%
+    tibble::deframe()
+aucs <- assay(AUCell::AUCell_calcAUC(
+        markers,
+        AUCell::AUCell_buildRankings(
+            counts(sce[auc_genes, ]),
+            plotStats = FALSE
+        ),
+        aucMaxRank = 700
+    ))
+
+# Normalize to make marker names valid colnames
+normalize_auc_names <- function(x) {
+    gsub("[: -]", "_", x)
+}
+
+#' @param x named vector AUC values for signatures
+summarize_aucs <- function(x) {
+    # Get highest-scoring tec signature
+    x <- sort(x, decreasing = TRUE)
+    is_mim <- names(x) %in% normalize_auc_names(names(mimetics:::LBL_SIGNATURE))
+    x_mim <- x[is_mim]
+    auc_max <- x_mim[1]
+    top_sig <- names(x_mim)[1]
+    data.frame(
+        top_all = names(x)[1],
+        top_tec = top_sig,
+        top_tec_rank = which(names(x) == top_sig),
+        nsig_near_top = sum(x >= 0.8 * max(x)),
+        top_tec_auc = auc_max,
+        top_tec_delta = auc_max - median(x),
+        aucs_q975 = quantile(x, 0.975),
+        aucs_median = median(x),
+        aucs_mean = mean(x),
+        aucs_sd = sd(x),
+        aucs_mad = mad(x),
+        aucs_max = max(x)
+    )
+}
+
+rownames(aucs) <- normalize_auc_names(rownames(aucs))
+aucs_agg <- do.call(rbind, apply(aucs, 2, summarize_aucs))
+colData(sce)[, colnames(aucs_agg)] <- aucs_agg
+colData(sce)[, paste0("auc_", rownames(aucs))] <- t(aucs[, colnames(sce)])
+```
+
+## Most frequent top signatures
+
+Count the cells in which a signature was the top hit:
+
+```{r}
+auc_tbl <- with(colData(sce), table(top_all, condition))
+head(auc_tbl[order(apply(auc_tbl, 1, sum), decreasing = TRUE), ], n = 10)
+```
+
+This confirms T cells/thymocytes and adipocytes as major contaminants.
+
+```{r}
+plotReducedDim(sce, "pp_UMAP", color = "auc_Panglao_Immune_system.T_memory_cells")
+plotReducedDim(sce, "pp_UMAP", color = "auc_Panglao_Connective_tissue.Adipocytes")
+```
+
+
+```{r}
+sce$top_is_contaminant <- sce$top_all %in% c(grep("T_?(memory_?)?[Cc]ell|[Aa]dipocyte", rownames(aucs), value = TRUE))
+sce$quick_cluster_prop_contam <- colData(sce) %>%
+    as_tibble() %>%
+    group_by(quick_cluster) %>%
+    mutate(prop_cont = sum(top_is_contaminant) / n()) %>%
+    pull(prop_cont)
+p_umap_contam <- plotReducedDim(sce, "pp_UMAP", color = "quick_cluster_prop_contam", text_by = "quick_cluster")
+MAX_PROP_CONTAM <- 0.6
+p_prop_contam <- colData(sce) %>%
+    as_tibble() %>%
+    distinct(x = quick_cluster, y = quick_cluster_prop_contam) %>%
+    ggplot(aes(forcats::fct_reorder(x, y), y)) +
+    geom_point() +
+    geom_hline(yintercept = MAX_PROP_CONTAM, linetype = "dashed", color = "red") +
+    labs(x = "Cluster", y = "Proportion of contaminating cells")
+
+p_umap_contam + p_prop_contam
+```
+
+Remove clusters with a proportion of contaminating cells over
+`r MAX_PROP_CONTAM`.
+
+Rerun PCA, perform batch correction, rerun UMAP and clustering.
+
+```{r, warning = FALSE}
+set.seed(123456)
+# Omit Clusters composed of mostly contaminating cells
+sce <- sce[, sce$quick_cluster_prop_contam < MAX_PROP_CONTAM]
+
+# Merge within conditions first, then between conditions
+# Store function in metadata so it can be re-used for subclustering.
+metadata(sce)[["get_merge.order"]] <- function(sce) {
+    with(unique(colData(sce)[, c("sample", "condition")]),
+        split(sample, condition)
+    )
+}
+
+reducedDim(sce, "corrected") <- sce %>%
+    batchelor::multiBatchNorm(batch = .[["sample"]]) %>%
+    batchelor::fastMNN(
+        batch = .[["sample"]],
+        merge.order = metadata(.)[["get_merge.order"]](.),
+        subset.row = getTopHVGs(modelGeneVar(., block = .[["sample"]])),
+        BPPARAM = BiocParallel::MulticoreParam()
+    ) %>%
+    reducedDim("corrected")
+
+sce <- runUMAP(sce, dimred = "corrected", name = "UMAP", n_neighbors = 15, min_dist = 0.5)
+plotReducedDim(sce, "UMAP")
+```
+
+```{r save}
+saveRDS(sce, file.path(ROOT, "pipeline/snrnaseq_preproc.rds"))
+```

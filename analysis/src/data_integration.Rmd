@@ -1,0 +1,171 @@
+---
+title: Integration of data from different time points and filtering of gene tables
+date: "`r Sys.Date()`"
+params:
+    universe: TRUE
+    # if TRUE, keep only genes that are present in ALL samples
+    # if FALSE, keep genes present in ANY sample and set missing counts to 0
+    sce_out: NULL
+---
+
+```{r setup, message = FALSE, results = "hide"}
+library(tidyverse)
+library(scran)
+library(scater)
+library(batchelor)
+devtools::load_all(file.path(ROOT, "R"))  # basically library(mimetics)
+
+universe <- params$universe
+stopifnot(!is.null(params$sce_out))
+```
+
+
+# Integrate data from different time points
+
+To facilitate uniform visualization of mimetic cell populations, unify all data
+sets in one consolidated object.
+
+Unify the following samples:
+
+
+```{r}
+sample_names <- c(
+    "embryo",
+    "newborn",
+    "W4BCFEM1",
+    "W4BCFEM2",
+    "W4BCMALE",
+    "W4WTMALE"
+)
+sample_names
+```
+
+```{r load-data, warning = FALSE}
+sce_paths <- file.path(ROOT, "pipeline", sprintf("sce_%s.rds", sample_names))
+sces <- lapply(sce_paths, readRDS)
+sce <- do.call(combineCols, unname(sces))
+```
+
+
+```{r universe-yes, eval = universe, results = "asis"}
+# keep genes present in ALL samples
+gene_universe <- lapply(sces, rownames)
+gene_universe <- Reduce(intersect, gene_universe)
+sce <- sce[gene_universe, ]
+```
+
+```{r universe-no, eval = !universe}
+# keep genes present in ANY sample and fill NAs with 0
+gene_missing <- is.na(assay(sce, "counts"))
+assay(sce, "counts")[gene_missing] <- 0
+assay(sce, "logcounts")[gene_missing] <- 0
+```
+
+There are **`r nrow(sce)` genes** in the data.
+
+```{r}
+# Realize delayed matrices
+assays(sce) <- lapply(assays(sce), as.matrix)
+```
+
+
+# UMAP
+
+Run a new UMAP dimensionality reduction for all data together.
+
+
+## Before integration
+
+Prior to data integration, the effect of different samples dominates for UMAP
+dimensionality reduction. The different populations (as defined by the previous
+RaceID analysis) do not overlap for different samples.
+
+```{r umap-before-integration}
+set.seed(123456)
+sce <- runUMAP(sce, min_dist = 0.5, metric = "euclidean", name = "UMAP_all", ntop = 2000, pca = 100)
+plotReducedDim(sce, dimred = "UMAP_all", color_by = "sample")
+plotReducedDim(sce, dimred = "UMAP_all", color_by = "label")
+```
+
+
+## After integration
+
+After integration, the labeled populations overlap across samples.
+
+```{r integration, warning = FALSE}
+set.seed(123456)
+
+# First integrate within time points, then between time points
+# Set timepoint levels to ensure correct merge order
+colData(sce)$timepoint <- factor(
+    colData(sce)$timepoint,
+    levels = c(
+        "embryo",
+        "newborn",
+        "4week"
+    )
+)
+metadata(sce)[["get_merge.order"]] <- function(sce) {
+    with(droplevels(unique(colData(sce)[, c("sample", "timepoint")])),
+        split(sample, timepoint)
+    )
+}
+
+# Set label levels for plotting order
+colData(sce)$label <- factor(colData(sce)$label)
+colData(sce)$label <- forcats::fct_relevel(colData(sce)$label,
+    "early_progenitor",
+    "postnatal_progenitor",
+    "mTEC",
+    "cTEC",
+    "cTEC_nurse"
+)
+
+
+run_fastMNN <- function(sce) {
+    sce %>%
+        batchelor::multiBatchNorm(., batch = .[["sample"]]) %>%
+        batchelor::fastMNN(
+            batch = .[["sample"]],
+            merge.order = metadata(.)[["get_merge.order"]](.),
+            subset.row = getTopHVGs(modelGeneVar(., block = .[["sample"]])),
+            BPPARAM = BiocParallel::MulticoreParam()
+        )
+}
+
+sce_corr <- run_fastMNN(sce)
+
+sce_4w <- sce[, sce$timepoint == "4week"]
+sce_corr_4w <- run_fastMNN(sce_4w)
+mat_corr_4w <- reducedDim(sce_corr_4w, "corrected")
+# Expand week4 correction matrix to allow adding to full data set
+mat_corr_4w_exp <- matrix(
+    nrow = nrow(reducedDim(sce_corr, "corrected")),
+    ncol = ncol(mat_corr_4w)
+)
+rownames(mat_corr_4w_exp) <- rownames(reducedDim(sce_corr, "corrected"))
+mat_corr_4w_exp[rownames(mat_corr_4w),] <- mat_corr_4w
+
+sce_corr <- runUMAP(sce_corr,
+    min_dist = 0.5,
+    dimred = "corrected",
+    name = "UMAP_int",
+    pca = 100)
+reducedDim(sce, "UMAP_int") <- reducedDim(sce_corr, "UMAP_int")
+reducedDim(sce, "fastMNN_all") <- reducedDim(sce_corr, "corrected")
+reducedDim(sce, "fastMNN_4w") <- mat_corr_4w_exp
+plotReducedDim(sce, "UMAP_int", color_by = "label")
+```
+
+```{r fig.height = 6}
+ggcells(sce, aes(UMAP_int.1, UMAP_int.2, color = label)) +
+    geom_point(size = 0.1) +
+    facet_grid(genotype ~ timepoint + barcoded, labeller = label_both) +
+    mimetics:::theme_umap
+```
+
+
+```{r save}
+# Save integrated sce object, including metadata
+saveRDS(sce, file.path(ROOT, params$sce_out))
+```

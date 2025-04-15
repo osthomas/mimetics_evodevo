@@ -1,0 +1,38 @@
+name: scrnaseq
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # infrastructure and interoperability between R and python
+  - python==3.11.9
+  - ipython==8.30.0
+  - jupyter==1.1.1
+  - pip
+  - r-base==4.2.3
+  - r-reticulate==1.38.0
+  - quarto==1.5.57
+  # R essentials
+  - r-tidyverse==1.3.2
+  - r-ggplot2==3.5.1
+  - r-remotes==2.4.2
+  - r-devtools==2.4.5
+  - r-patchwork==1.2.0
+  - r-geomtextpath==0.1.4
+  # R: single cell
+  - r-matrix==1.6_1
+  - r-matrixstats==1.0.0
+  - r-hdf5r==1.3.10
+  - bioconductor-aucell==1.20.1
+  - bioconductor-scran==1.26.0
+  - bioconductor-scater==1.26.0
+  - bioconductor-batchelor==1.14.0
+  - bioconductor-scdblfinder==1.12.0
+  - bioconductor-complexheatmap==2.14.0
+  - bioconductor-zellkonverter==1.8.0
+  # Python: single cell
+  - pip:
+    - igraph==0.11.8
+    - leidenalg==0.10.2
+  - anndata==0.11.1
+  - scanpy==1.10.3
+  - cellrank==2.0.6

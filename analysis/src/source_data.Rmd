@@ -1,0 +1,287 @@
+---
+title: Source Data
+---
+
+Collect data and arrange as source data Excel files.
+
+```{r packages, message = FALSE, warning = FALSE}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(readxl)
+library(writexl)
+# input
+BULK <- file.path(ROOT, "analysis", "output", "figures", "bulk")
+SC <- file.path(ROOT, "analysis", "output", "figures", "sc")
+SC_FATE <- file.path(ROOT, "analysis", "output", "figures", "sc_fate")
+SN <- file.path(ROOT, "analysis", "output", "figures", "snrnaseq")
+FACS <- file.path(ROOT, "analysis", "output", "figures", "facs")
+
+# output
+SOURCE_DATA <- file.path(
+    ROOT,
+    "analysis",
+    "output",
+    "figures",
+    "paper",
+    "source_data"
+)
+dir.create(SOURCE_DATA, recursive = TRUE)
+```
+
+```{r fig1}
+fig1 <- list(
+    fig1a_1 = read_xlsx(file.path(BULK, "fig1ab.xlsx"), sheet = "genes"),
+    fig1a_2 = read_xlsx(file.path(BULK, "fig1ab.xlsx"), sheet = "signatures"),
+    fig1b = read_xlsx(file.path(BULK, "fig1ab.xlsx"), sheet = "signatures"),
+    fig1c = read_tsv(file.path(SC, "tbl_genes_agg.tsv")) %>%
+        select(-Aire, -Fezf2),
+    fig1d = read_tsv(file.path(SC, "tbl_barcoded.tsv"))
+)
+write_xlsx(fig1, file.path(SOURCE_DATA, "fig1.xlsx"))
+```
+
+
+```{r fig2}
+fig2 <- list(
+    fig2ab = read_tsv(file.path(FACS, "tbl_facs_strains.tsv"))[, c(
+        "strain",
+        "thymocytes_1e6",
+        "tecs_1e3"
+    )],
+    fig2c = read_xlsx(
+        file.path(BULK, "fig2c_edf7a.xlsx"),
+        sheet = "signatures"
+    ),
+    fig2d = read_xlsx(
+        file.path(BULK, "fig2d_edf7b.xlsx"),
+        sheet = "signatures"
+    ),
+    fig2e = read_xlsx(
+        file.path(BULK, "fig2e_edf7c.xlsx"),
+        sheet = "signatures"
+    ),
+    fig2f = read_xlsx(
+        file.path(BULK, "fig2f_edf7e.xlsx"),
+        sheet = "signatures"
+    ),
+    fig2h = read_xlsx(file.path(BULK, "fig2h_edf7f.xlsx"), sheet = "signatures")
+)
+write_xlsx(fig2, file.path(SOURCE_DATA, "fig2.xlsx"))
+```
+
+
+```{r fig3}
+fig3 <- list(
+    fig3a = read_tsv(file.path(FACS, "tbl_facs_lur.tsv")),
+    fig3d = read_tsv(file.path(BULK, "tbl_chi6_pca.tsv")),
+    fig3e = read_tsv(file.path(FACS, "tbl_facs_chi6.tsv"))[, c(
+        "strain",
+        "thymocytes_count_dp_1e6"
+    )],
+    fig3f = read_xlsx(file.path(BULK, "fig3f_edf8b.xlsx"), sheet = "signatures")
+)
+write_xlsx(fig3, file.path(SOURCE_DATA, "fig3.xlsx"))
+```
+
+
+```{r fig4}
+fig4 <- list(
+    fig4a = read_xlsx(
+        file.path(BULK, "fig4a_edf9a.xlsx"),
+        sheet = "signatures"
+    ),
+    fig4c = read_tsv(file.path(SN, "tbl_umap.tsv")),
+    fig4d = read_tsv(file.path(SN, "tbl_props.tsv"))
+)
+write_xlsx(fig4, file.path(SOURCE_DATA, "fig4.xlsx"))
+```
+
+
+```{r fig5}
+fig5 <- list(
+    fig5f = read_xlsx(
+        file.path(BULK, "fig5f_edf10d.xlsx"),
+        sheet = "signatures"
+    ),
+    fig5g = read_xlsx(
+        file.path(BULK, "fig5g_edf11a.xlsx"),
+        sheet = "signatures"
+    ),
+    fig5h = read_xlsx(
+        file.path(BULK, "fig5h_edf11c.xlsx"),
+        sheet = "signatures"
+    )
+)
+write_xlsx(fig5, file.path(SOURCE_DATA, "fig5.xlsx"))
+```
+
+
+```{r edf1}
+edf1 <- list(
+    edf1a_1 = read_tsv(file.path(SC, "tbl_auc_hist1.tsv")),
+    edf1a_2 = read_tsv(file.path(SC, "tbl_auc_hist2.tsv")),
+    edf1b = read_tsv(file.path(SC, "tbl_auc_jaccard.tsv")),
+    edf1c = read_tsv(file.path(SC, "tbl_umap.tsv")),
+    edf1d = read_tsv(file.path(SC, "tbl_genes_agg.tsv")) %>% select(-Foxn1),
+    edf1e = read_tsv(file.path(SC, "tbl_sccoda.tsv"))
+)
+write_xlsx(edf1, file.path(SOURCE_DATA, "edf1.xlsx"))
+```
+
+
+```{r edf2}
+edf2 <- list(
+    edf2d = read_tsv(file.path(ROOT, "data", "ish_counts", "edf2d.tsv"))
+)
+write_xlsx(edf2, file.path(SOURCE_DATA, "edf2.xlsx"))
+```
+
+
+```{r edf3}
+edf3 <- list(
+    edf3a = read_tsv(file.path(SC, "tbl_foxn1_pop.tsv")),
+    edf3b = read_tsv(file.path(SC, "tbl_foxn1_mim.tsv")),
+    edf3c = read_tsv(file.path(SC, "tbl_barcode_pvals.tsv"))
+)
+write_xlsx(edf3, file.path(SOURCE_DATA, "edf3.xlsx"))
+```
+
+
+```{r edf4}
+edf4 <- list(
+    edf4b = read_tsv(file.path(ROOT, "data", "ish_counts", "edf4b.tsv"))
+)
+write_xlsx(edf4, file.path(SOURCE_DATA, "edf4.xlsx"))
+```
+
+
+```{r edf5}
+edf5 <- list(
+    edf5abc = read_tsv(file.path(SC_FATE, "auto", "tbl_umap.tsv")),
+    edf5d = read_tsv(file.path(SC_FATE, "auto", "tbl_jaccard.tsv"))
+)
+write_xlsx(edf5, file.path(SOURCE_DATA, "edf5.xlsx"))
+```
+
+
+
+```{r edf6}
+edf6_values <- c(
+    "thymocytes_count_cd45_1e6",
+    "thymocytes_count_dp_1e6",
+    "tecs_1e3",
+    "TI",
+    "tec_count_Ly51+UEA1-_1e3",
+    "tec_count_Ly51-UEA1+_1e3"
+)
+edf6 <- list(
+    edf6abcdef = read_tsv(file.path(FACS, "tbl_facs_back.tsv"))[, c(
+        "strain",
+        "generation",
+        edf6_values
+    )]
+)
+write_xlsx(edf6, file.path(SOURCE_DATA, "edf6.xlsx"))
+```
+
+
+```{r edf7}
+edf7 <- list(
+    edf7a_1 = read_xlsx(file.path(BULK, "fig2c_edf7a.xlsx"), sheet = "genes"),
+    edf7a_2 = read_xlsx(
+        file.path(BULK, "fig2c_edf7a.xlsx"),
+        sheet = "signatures"
+    ),
+    edf7b_1 = read_xlsx(file.path(BULK, "fig2d_edf7b.xlsx"), sheet = "genes"),
+    edf7b_2 = read_xlsx(
+        file.path(BULK, "fig2d_edf7b.xlsx"),
+        sheet = "signatures"
+    ),
+    edf7c_1 = read_xlsx(file.path(BULK, "fig2e_edf7c.xlsx"), sheet = "genes"),
+    edf7c_2 = read_xlsx(
+        file.path(BULK, "fig2e_edf7c.xlsx"),
+        sheet = "signatures"
+    ),
+    edf7d = read_tsv(file.path(SC, "tbl_umap_genes.tsv")),
+    edf7e_1 = read_xlsx(file.path(BULK, "fig2f_edf7e.xlsx"), sheet = "genes"),
+    edf7e_2 = read_xlsx(
+        file.path(BULK, "fig2f_edf7e.xlsx"),
+        sheet = "signatures"
+    ),
+    edf7f_1 = read_xlsx(file.path(BULK, "fig2h_edf7f.xlsx"), sheet = "genes"),
+    edf7f_2 = read_xlsx(
+        file.path(BULK, "fig2h_edf7f.xlsx"),
+        sheet = "signatures"
+    )
+)
+write_xlsx(edf7, file.path(SOURCE_DATA, "edf7.xlsx"))
+```
+
+
+```{r edf8}
+edf8_values <- c(
+    "thymocytes_prc_dp_of_cd45",
+    "thymocytes_prc_cd19_of_dn",
+    "thymocytes_prc_cd4sp_of_cd45",
+    "thymocytes_prc_cd8sp_of_cd45",
+    "thymocytes_prc_tcrb_of_dn",
+    "thymocytes_prc_dn_of_cd45"
+)
+edf8 <- list(
+    edf8a = read_tsv(file.path(FACS, "tbl_facs_chi6.tsv"))[, c(
+        "strain",
+        "generation",
+        edf8_values
+    )],
+    edf8b_1 = read_xlsx(file.path(BULK, "fig3f_edf8b.xlsx"), sheet = "genes"),
+    edf8b_2 = read_xlsx(
+        file.path(BULK, "fig3f_edf8b.xlsx"),
+        sheet = "signatures"
+    )
+)
+write_xlsx(edf8, file.path(SOURCE_DATA, "edf8.xlsx"))
+```
+
+
+```{r edf9}
+edf9 <- list(
+    edf9a_1 = read_xlsx(file.path(BULK, "fig4a_edf9a.xlsx"), sheet = "genes"),
+    edf9a_2 = read_xlsx(
+        file.path(BULK, "fig4a_edf9a.xlsx"),
+        sheet = "signatures"
+    ),
+    edf9cdf = read_tsv(file.path(SN, "tbl_umap.tsv")),
+    edf9e = read_tsv(file.path(SN, "tbl_props.tsv"))
+)
+write_xlsx(edf9, file.path(SOURCE_DATA, "edf9.xlsx"))
+```
+
+
+```{r edf10}
+edf10 <- list(
+    edf10d_1 = read_xlsx(file.path(BULK, "fig5f_edf10d.xlsx"), sheet = "genes"),
+    edf10d_2 = read_xlsx(
+        file.path(BULK, "fig5f_edf10d.xlsx"),
+        sheet = "signatures"
+    )
+)
+write_xlsx(edf10, file.path(SOURCE_DATA, "edf10.xlsx"))
+```
+
+
+```{r edf11}
+edf11 <- list(
+    edf11a_1 = read_xlsx(file.path(BULK, "fig5g_edf11a.xlsx"), sheet = "genes"),
+    edf11a_2 = read_xlsx(
+        file.path(BULK, "fig5g_edf11a.xlsx"),
+        sheet = "signatures"
+    ),
+    edf11c_1 = read_xlsx(file.path(BULK, "fig5h_edf11c.xlsx"), sheet = "genes"),
+    edf11c_2 = read_xlsx(
+        file.path(BULK, "fig5h_edf11c.xlsx"),
+        sheet = "signatures"
+    )
+)
+write_xlsx(edf11, file.path(SOURCE_DATA, "edf11.xlsx"))
+```

@@ -1,0 +1,9 @@
+name: cellbender
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.7
+  - pip
+  - pip:
+    - cellbender==0.3.0

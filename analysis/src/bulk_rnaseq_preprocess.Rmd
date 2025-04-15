@@ -1,0 +1,147 @@
+---
+title: Preprocess bulk RNAseq data
+data: "`r Sys.Date()`"
+---
+
+# Read Data
+
+```{r setup, message = FALSE}
+library(tidyverse)
+library(edgeR)
+library(limma)
+devtools::load_all(file.path(ROOT, "R"))
+
+basedir <- file.path(ROOT, "data", "bulk_rnaseq")
+read_counts <- function(fpath) {
+    sample <- gsub("[.]tsv$", "", basename(fpath))
+    cts <- read.csv(fpath, sep = "\t")
+    cts$sample <- sample
+    return(cts)
+}
+
+
+# M. musculus
+# -----------
+dir_mm <- file.path(basedir, "m_musculus")
+
+# Metadata
+meta_mm <- read.csv(file.path(dir_mm, "metadata.tsv"), sep = "\t") %>%
+    filter(!is.na(file)) %>%
+    mutate(
+        condition = factor(condition),
+        condition = forcats::fct_relevel(condition, "WT", "Foxn1het", "Foxn1KO", "cmF1", "cmF4", "AF4"),
+        strain = factor(strain),
+        strain = forcats::fct_relevel(strain, "B6"),
+        age = factor(age),
+        age = forcats::fct_relevel(age, "P28")
+    )
+rownames(meta_mm) <- meta_mm$sample
+meta_mm$group <- interaction(meta_mm$strain, meta_mm$condition, meta_mm$age)
+# Omit age for chimera 6 samples
+chi6_idx <- meta_mm$condition %in% c("chi6.down", "chi6.up")
+chi6_grp <- interaction(meta_mm$strain[chi6_idx], meta_mm$condition[chi6_idx])
+levels(meta_mm$group) <- levels(forcats::fct_c(meta_mm$group, chi6_grp))
+meta_mm$group[chi6_idx] <- chi6_grp
+meta_mm <- droplevels(meta_mm)
+meta_mm$species <- "M. musculus"
+
+# Counts
+cts_paths_mm <- file.path(dir_mm, "counts", meta_mm$file)
+cts_mm <- bind_rows(lapply(cts_paths_mm, read_counts)) %>%
+        filter(ensembl_gene_id != "ENSMUSG00000102693") %>% # not in all samples
+        pivot_wider(
+            id_cols = "ensembl_gene_id",
+            names_from = "sample",
+            values_from = "count"
+        ) %>%
+        column_to_rownames("ensembl_gene_id") %>%
+        as.matrix()
+# Remove low count genes
+keep_mm <- apply(cts_mm > 5, 1, mean) > 0.5
+cts_mm <- cts_mm[keep_mm, , drop = FALSE]
+
+dge_mm <- DGEList(cts_mm, samples = meta_mm)
+dge_mm <- calcNormFactors(dge_mm)
+
+# D. rerio
+# --------
+dir_dr <- file.path(basedir, "d_rerio")
+
+# Metadata
+cts_paths_dr <- dir(file.path(dir_dr, "counts"), pattern = "[.]tsv$", full = TRUE)
+meta_dr <- read.csv(file.path(dir_dr, "metadata.tsv"), sep = "\t") %>%
+    mutate(condition = factor(condition, c("WT", "Foxn1KO")))
+meta_dr$group <- meta_dr$condition
+meta_dr$species <- "D. rerio"
+
+# Counts
+cts_dr <- bind_rows(lapply(cts_paths_dr, read_counts)) %>%
+        pivot_wider(
+            id_cols = "ensembl_gene_id",
+            names_from = "sample",
+            values_from = "count"
+        ) %>%
+        column_to_rownames("ensembl_gene_id") %>%
+        as.matrix()
+# Remove low count genes
+keep_dr <- apply(cts_dr > 5, 1, mean) >= 0.5
+cts_dr <- cts_dr[keep_dr, , drop = FALSE]
+
+dge_dr <- DGEList(cts_dr, samples = meta_dr)
+dge_dr <- calcNormFactors(dge_dr)
+```
+
+
+# Annotate Gene IDs
+
+Genes are not annotated in the count matrix. Instead, the relevant marker sets
+are translated to IDs in downstream analyses.
+
+
+# Voom and MDS
+
+```{r pca-mm}
+v_mm <- voomWithQualityWeights(dge_mm, model.matrix(~0 + group, data = dge_mm$samples))
+mds_mm <- plotMDS(v_mm, plot = FALSE)
+dat_mds_mm <- v_mm$target %>%
+    right_join(data.frame(
+        sample = colnames(v_mm),
+        PC1 = mds_mm$x, PC2 = mds_mm$y
+    ))
+ggplot(dat_mds_mm, aes(PC1, PC2, color = strain, shape = paste(condition, age))) +
+    geom_point(size = 2) +
+    labs(
+        title = "M. musculus",
+        x = sprintf("%s 1 (%.1f%%)", mds_mm$axislabel, mds_mm$var.explained[1] * 100),
+        y = sprintf("%s 2 (%.1f%%)", mds_mm$axislabel, mds_mm$var.explained[2] * 100)
+    ) +
+    scale_shape_manual(values = unique(c(19, 1:20))) +
+    coord_fixed(ratio = mds_mm$var.explained[2] / mds_mm$var.explained[1])
+```
+
+
+```{r pca-dr}
+v_dr <- voomWithQualityWeights(dge_dr, model.matrix(~0 + group, data = dge_dr$samples))
+mds_dr <- plotMDS(v_dr, plot = FALSE)
+dat_mds_dr <- v_dr$target %>%
+    right_join(data.frame(
+        sample = colnames(v_dr),
+        PC1 = mds_dr$x, PC2 = mds_dr$y
+    ))
+ggplot(dat_mds_dr, aes(PC1, PC2, color = condition)) +
+    geom_point() +
+    labs(
+        title = "D. rerio",
+        x = sprintf("%s 1 (%.1f%%)", mds_dr$axislabel, mds_dr$var.explained[1] * 100),
+        y = sprintf("%s 2 (%.1f%%)", mds_dr$axislabel, mds_dr$var.explained[2] * 100)
+    ) +
+    coord_fixed(ratio = mds_dr$var.explained[2] / mds_dr$var.explained[1])
+```
+
+
+```{r write-data}
+saveRDS(dge_mm, file.path(ROOT, "pipeline", "dge_mm.rds"))
+saveRDS(dge_dr, file.path(ROOT, "pipeline", "dge_dr.rds"))
+saveRDS(v_mm, file.path(ROOT, "pipeline", "v_mm.rds"))
+saveRDS(v_dr, file.path(ROOT, "pipeline", "v_dr.rds"))
+```

@@ -1,0 +1,899 @@
+---
+title: Analysis of bulk RNAseq data for mimetic signatures
+subtitle: Analysis with `limma`/`camera`
+date: "`r Sys.Date()`"
+---
+
+
+```{r setup, message = FALSE}
+library(tidyverse)
+library(patchwork)
+library(limma)
+library(edgeR)
+devtools::load_all(file.path(ROOT, "R"))
+FIGS <- file.path(ROOT, "analysis", "output", "figures", "bulk")
+dir.create(FIGS, recursive = TRUE, showWarnings = FALSE)
+
+
+# Load previously defined collapsed marker sets
+markers_mimetics_list <- readRDS(file.path(ROOT, "pipeline", "markers_mimetics_collapsed.rds"))
+markers_list <- readRDS(file.path(ROOT, "pipeline", "markers_collapsed.rds"))
+# Keep mimetic signatures and cTEC/mTEC/progenitors
+markers_tecs <- c(
+    markers_mimetics_list,
+    markers_list[c("early_progenitor", "postnatal_progenitor", "cTEC", "mTEC")]
+)
+markers_panglao <- readRDS(file.path(ROOT, "pipeline", "markers_panglao.rds"))
+markers_tmuris <- readRDS(file.path(ROOT, "pipeline", "markers_tmuris.rds"))
+markers_msigdb <- readRDS(file.path(ROOT, "pipeline", "markers_msigdb.rds"))
+sets <- c(markers_tecs, markers_panglao, markers_tmuris, markers_msigdb)
+
+
+#' Primitively classify source of a signature based on its name prefix
+sourceof <- function(signature) {
+    case_when(
+        grepl("Panglao", signature) ~ "PanglaoDB",
+        grepl("random", signature) ~ "random",
+        grepl("TM:", signature) ~ "T. muris",
+        grepl("msigdb:", signature) ~ "MSigDB",
+        .default = "TEC"
+    )
+}
+
+ensembl_res_mm <- read.csv(file.path(ROOT, "pipeline", "ensembl_genes_mm.tsv"), sep = "\t")
+```
+
+# Marker sets: Filter
+
+Filter background signatures by restricting gene set sizes to sizes in the
+range of our TEC signatures.
+
+```{r supp_sig_size_hist, fig.height = 2, fig.width = 3}
+tec_set_range <- range(sapply(markers_tecs, length)) * c(0.9, 1.1)
+sets_df <- enframe(sets, "signature", "gene") %>%
+    unnest(gene) %>%
+    group_by(signature) %>%
+    mutate(signature_size = length(unique(gene))) %>%
+    mutate(source = sourceof(signature))
+
+p_sig_hist <- distinct(sets_df, signature, signature_size, source) %>%
+    ggplot(aes(signature_size, fill = source)) +
+    geom_histogram(binwidth = 30) +
+    annotate(
+        geom = "rect", alpha = 0.3,
+        xmin = tec_set_range[1], xmax = tec_set_range[2],
+        ymin = -Inf, ymax = Inf
+    ) +
+    scale_y_continuous(expand = expansion(c(0, 0.05))) +
+    labs(x = "Signature size", y = "Count", fill = "Signature source") +
+    theme(legend.position = "inside") +
+    guides(color = guide_legend(override.aes = list(size = 2), ncol = 2))
+p_sig_hist
+fig_pdf(FIGS, p_sig_hist)
+
+
+sets_df <- sets_df %>%
+    filter(signature_size >= tec_set_range[1] & signature_size <= tec_set_range[2])
+sets <- sets_df %>%
+    summarize(gene = list(gene)) %>%
+    deframe()
+
+# Order for plotting
+TEC_SIG_ORDER <- levels(forcats::fct_relevel(names(markers_tecs), TEC_SIG_ORDER))
+
+# Until here, sets use gene names. Those differ between species.
+# Translate sets to use gene IDs instead of names
+# NOTE: If there are many-to-many relationships for genes between species, then
+# the marker sets may expand to include all the orthologues.
+sets2ids <- function(sets, ensembl, id_col, name_col) {
+    ensembl <- ensembl[c(name_col, id_col)]
+    ensembl <- ensembl[!is.na(ensembl[[name_col]]), ]
+    # Make name-to-IDs map
+    gnames2gids <- lapply(split(ensembl[[id_col]], ensembl[[name_col]]), unique)
+    sets_ids <- lapply(sets, function(gnames) {
+        set <- unique(na.omit(unlist(gnames2gids[gnames])))
+        set
+    })
+    sets_ids
+}
+
+sets_mm <- sets2ids(sets, ensembl_res_mm, "ensembl_gene_id", "external_gene_name")
+sets_dr <- sets2ids(sets, ensembl_res_mm, "drerio_homolog_ensembl_gene", "external_gene_name")
+
+# Write sets
+write.table(sets_df, file.path(FIGS, "tbl_markers.tsv"), sep = "\t", row.names = FALSE)
+```
+
+
+# Camera
+
+* Run `camera` on the data set, using the filtered marker sets.
+* Take log10 of the adjusted p values. Multiply by -1 if upregulated, as
+  determined by `camera`.
+
+
+```{r thresholds}
+# Thresholds for limma
+ALPHA <- 0.01
+LFCTHRESH <- log2(1.2)
+
+# Thresholds for camera
+ALPHA_CAMERA <- 1e-2
+NTOP_CAMERA <- 20
+```
+
+```{r run}
+comparisons_mm <- list(
+    "Foxn1KO-vs-WT" = c("group", "B6.Foxn1KO.P28", "B6.WT.P28"),
+    "cmF1-vs-WT" = c("group", "B6.cmF1.P28", "B6.WT.P28"),
+    "cmF4-vs-WT" = c("group", "B6.cmF4.P28", "B6.WT.P28"),
+    "cmF4-vs-cmF1" = c("group", "B6.cmF4.P28", "B6.cmF1.P28"),
+    "cmdtgF1F4-vs-WT" = c("group", "B6.cmdtgF1F4.P28", "B6.WT.P28"),
+    "AF4-vs-WT" = c("group", "B6.AF4.P28", "B6.WT.P28"),
+    "Foxn1het-vs-WT" = c("group", "B6.Foxn1het.P28", "B6.WT.P28"),
+    "Ascl1KO-vs-WT" = c("group", "B6.Ascl1KO.P28", "B6.WT.P28"),
+    "Bmp4-vs-WT" = c("group", "B6.Bmp4.P28", "B6.WT.P28"),
+    "Fgf7wt-vs-WT" = c("group", "B6.Fgf7wt.P28", "B6.WT.P28"),
+    "Fgf7het-vs-WT" = c("group", "B6.Fgf7het.P28", "B6.WT.P28"),
+    "cardPos-vs-cardNeg" = c("group", "B6.RosaYFPposmCardpos.P28", "B6.RosaYFPposmCardneg.P28"),
+    "PWK.WT-vs-B6.WT" = c("group", "PWK.WT.P28", "B6.WT.P28"),
+    "FVB.WT-vs-B6.WT" = c("group", "FVB.WT.P28", "B6.WT.P28"),
+    "E15-vs-P28" = c("group", "B6.WT.E15_5", "B6.WT.P28"),
+    "P1-vs-P28" = c("group", "B6.WT.P1", "B6.WT.P28"),
+    "chi6.up-vs-FVB.WT" = c("group", "FVB.chi6.up", "FVB.WT.P28"),
+    "chi6.down-vs-FVB.WT" = c("group", "FVB.chi6.down", "FVB.WT.P28")
+)
+v_mm <- readRDS(file.path(ROOT, "pipeline", "v_mm.rds"))
+dat_camera_mm <- run_camera(v_mm, sets_mm, comparisons_mm, lfc = LFCTHRESH)
+dat_limma_mm <- run_limma(v_mm, comparisons_mm, lfc = LFCTHRESH)
+
+comparisons_dr <- list("DR.Foxn1KO-vs-DR.WT" = c("group", "Foxn1KO", "WT"))
+v_dr <- readRDS(file.path(ROOT, "pipeline", "v_dr.rds"))
+dat_camera_dr <- run_camera(v_dr, sets_dr, comparisons_dr, lfc = LFCTHRESH)
+dat_limma_dr <- run_limma(v_dr, comparisons_dr, lfc = LFCTHRESH)
+
+# Write tables
+write_compressed <- function(data, path) {
+    gz <- gzfile(path, "w", compression = 9)
+    write.table(data, gz, sep = "\t", row.names = FALSE)
+    close(gz)
+}
+write_compressed(dat_limma_mm, file.path(FIGS, "tbl_limma_mm.tsv.gz"))
+write_compressed(dat_limma_dr, file.path(FIGS, "tbl_limma_dr.tsv.gz"))
+write.table(dat_camera_mm, file.path(FIGS, "tbl_camera_mm.tsv"), sep = "\t", row.names = FALSE)
+write.table(dat_camera_dr, file.path(FIGS, "tbl_camera_dr.tsv"), sep = "\t", row.names = FALSE)
+```
+
+
+```{r plotfuns}
+#' WRAPPER
+#' Wrap plt_camera_overall with default labels and jitter points
+plt_camera_overall <- function(dat_camera, comparisons = NULL, alpha = ALPHA_CAMERA) {
+    pj <- position_jitterdodge(
+        dodge.width = 0.2,
+        jitter.width = 0.1,
+        jitter.height = 0
+    )
+    p <- mimetics::plt_camera_overall(dat_camera, comparisons, alpha) +
+        aes(color = sourceof(signature)) +
+        labs(color = "Signature source") +
+        scale_x_discrete(limits = comparisons, labels = labeller_comparison)
+    p$layers[[1]]$position <- pj
+    p
+}
+
+
+#' WRAPPER
+#' Wrap plt_camera_top with default labels and thresholds, and highlight TEC signatures
+plt_camera_top <- function(
+    dat_camera,
+    comparisons = NULL,
+    alpha = ALPHA_CAMERA,
+    ntop = NTOP_CAMERA
+) {
+    p <- mimetics::plt_camera_top(dat_camera, comparisons, alpha, ntop) +
+        geom_hline(
+            data = ~ filter(., sourceof(signature) == "TEC"),
+            linewidth = 0.2,
+            aes(yintercept = signature),
+            color = "red"
+        ) +
+        scale_y_discrete(labels = LBL_SIGNATURE) +
+        facet_wrap(
+            ~comparison,
+            labeller = as_labeller(labeller_comparison, label_parsed)
+        )
+    p
+}
+
+
+#' WRAPPER
+#' Wrap plt_barcode with default labels
+plt_barcode <- function(dat, comparisons, sets, dat_camera) {
+    p <- mimetics::plt_barcode(dat, comparisons, sets, dat_camera) +
+        facet_wrap(
+            ~comparison,
+            labeller = as_labeller(labeller_comparison, label_parsed)
+        )
+    sc_y <- scale_y_discrete(
+        name = NULL,
+        limits = rev(c("All Genes", names(sets))),
+        labels = LBL_SIGNATURE
+    )
+    # Suppress message indicating replacement of scales
+    suppressMessages(p + sc_y)
+}
+
+
+#' WRAPPER
+#' Wrap plt_camera_hm with default labels
+plt_camera_hm <- function(dat, comparisons = NULL, sets = NULL, col_lim = 10) {
+    p <- mimetics::plt_camera_hm(dat, comparisons, sets, col_lim)
+    sc_x <- scale_x_discrete(
+        limits = comparisons,
+        labels = labeller_comparison,
+        expand = c(0, 0),
+    )
+    sc_y <- scale_y_discrete(
+        limits = rev(sets),
+        labels = LBL_SIGNATURE,
+        expand = c(0, 0)
+    )
+    # Suppress message indicating replacement of scales
+    suppressMessages(p + sc_x + sc_y)
+}
+
+
+#' Save source data tables for enrichment plots
+save_sourcedata <- function(p, xlsx) {
+    genes_dat <- p$data[, c("comparison", "gene", "signature", "t")] %>%
+        arrange(comparison, signature, gene, t)
+    signatures_dat <- p$layers[[4]]$data[, c("comparison", "signature", "signed.padj.camera")] %>%
+        arrange(comparison, signature, signed.padj.camera)
+    writexl::write_xlsx(list(genes = genes_dat, signatures = signatures_dat), path = xlsx)
+}
+
+
+#' Determine width of a heatmap based on number of comparisons (inches)
+w_hm <- function(comparisons) {
+    1.6 + length(comparisons) * 0.1
+}
+```
+
+
+# M. Musculus - Overall enrichment
+
+```{r, supp_mm_cam_all, fig.height = 3, fig.width = 5}
+p_mm_cam_all <- plt_camera_overall(dat_camera_mm)
+p_mm_cam_all
+fig_pdf(FIGS, p_mm_cam_all)
+```
+
+
+<!-- ---------------------------------------------------------------------- -->
+
+
+# M. musculus - Development
+
+Comparisons involving developmental time points.
+
+```{r}
+cmp_mm_devel <- c(
+    "E15-vs-P28",
+    "P1-vs-P28"
+)
+```
+
+```{r, supp_mm_devel_camtop, fig.height = 3, fig.width = 5}
+for (cmp_ in cmp_mm_devel) {
+    p_ <- plt_camera_top(dat_camera_mm, cmp_)
+    print(p_)
+    fig_pdf(FIGS, p_, suffix = cmp_)
+}
+```
+
+```{r, supp_mm_devel_lines, fig.height = 2.5, fig.width = 4}
+p_mm_devel_lines <- plt_barcode(
+    dat_limma_mm,
+    comparisons = cmp_mm_devel,
+    sets =  sets_mm[TEC_SIG_ORDER],
+    dat_camera = dat_camera_mm
+)
+p_mm_devel_lines
+fig_pdf(FIGS, p_mm_devel_lines)
+save_sourcedata(p_mm_devel_lines, file.path(FIGS, "fig1ab.xlsx"))
+```
+
+```{r, fig_mm_devel_hm, fig.height = 3, fig.width = w_hm(cmp_mm_devel)}
+p_mm_devel_hm <- plt_camera_hm(
+    dat_camera_mm,
+    comparisons = cmp_mm_devel,
+    sets = TEC_SIG_ORDER
+)
+p_mm_devel_hm
+fig_pdf(FIGS, p_mm_devel_hm)
+```
+
+# M. musculus - Strains
+
+Comparisons involving different mouse strains.
+
+```{r}
+cmp_mm_strains <- c(
+    "PWK.WT-vs-B6.WT"
+)
+```
+
+```{r, supp_mm_strains_camtop, fig.height = 3, fig.width = 5}
+for (cmp_ in cmp_mm_strains) {
+    p_ <- plt_camera_top(dat_camera_mm, cmp_)
+    print(p_)
+    fig_pdf(FIGS, p_, suffix = cmp_)
+}
+```
+
+```{r, supp_mm_strains_lines, fig.height = 2, fig.width = 2}
+p_mm_strains_lines <- plt_barcode(
+    dat_limma_mm,
+    comparisons = cmp_mm_strains,
+    sets =  sets_mm[TEC_SIG_ORDER],
+    dat_camera = dat_camera_mm
+)
+p_mm_strains_lines
+fig_pdf(FIGS, p_mm_strains_lines)
+save_sourcedata(p_mm_strains_lines, file.path(FIGS, "fig2c_edf7a.xlsx"))
+```
+
+```{r, fig_mm_strains_hm, fig.height = 2, fig.width = w_hm(cmp_mm_strains)}
+p_mm_strains_hm <- plt_camera_hm(
+    dat_camera_mm,
+    comparisons = cmp_mm_strains,
+    sets = TEC_SIG_ORDER
+)
+p_mm_strains_hm <- p_mm_strains_hm +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5))
+p_mm_strains_hm
+fig_pdf(FIGS, p_mm_strains_hm)
+```
+
+
+<!-- ---------------------------------------------------------------------- -->
+
+
+# M. musculus - Bmp4, Ascl1KO
+
+Comparisons involving the genes mentioned above.
+
+```{r}
+cmp_mm_ba <- c(
+    "Bmp4-vs-WT",
+    "Ascl1KO-vs-WT"
+)
+```
+
+```{r, supp_mm_ba_camtop, fig.height = 3, fig.width = 5}
+for (cmp_ in cmp_mm_ba) {
+    p_ <- plt_camera_top(dat_camera_mm, cmp_)
+    print(p_)
+    fig_pdf(FIGS, p_, suffix = cmp_)
+}
+```
+
+```{r, fig_mm_ba_lines, fig.height = 2, fig.width = 3.5}
+p_mm_ba_lines <- plt_barcode(
+    dat_limma_mm,
+    comparisons = cmp_mm_ba,
+    sets =  sets_mm[TEC_SIG_ORDER],
+    dat_camera = dat_camera_mm
+)
+p_mm_ba_lines
+fig_pdf(FIGS, p_mm_ba_lines)
+save_sourcedata(p_mm_ba_lines, file.path(FIGS, "fig2e_edf7c.xlsx"))
+```
+
+```{r, fig_mm_ba_hm, fig.height = 3, fig.width = w_hm(cmp_mm_ba)}
+p_mm_ba_hm <- plt_camera_hm(
+    dat_camera_mm,
+    comparisons = cmp_mm_ba,
+    sets = TEC_SIG_ORDER
+)
+p_mm_ba_hm
+fig_pdf(FIGS, p_mm_ba_hm)
+```
+
+
+<!-- ---------------------------------------------------------------------- -->
+
+
+# M. musculus - Het Foxn1
+
+Comparison with heterozygous Foxn1
+
+```{r}
+cmp_mm_foxn1het <- c(
+    "Foxn1het-vs-WT"
+)
+```
+
+```{r, supp_mm_foxn1het_camtop, fig.height = 3, fig.width = 5}
+for (cmp_ in cmp_mm_foxn1het) {
+    p_ <- plt_camera_top(dat_camera_mm, cmp_)
+    print(p_)
+    fig_pdf(FIGS, p_, suffix = cmp_)
+}
+```
+
+```{r, supp_mm_foxn1het_lines, fig.height = 2, fig.width = 2.1}
+p_mm_foxn1het_lines <- plt_barcode(
+    dat_limma_mm,
+    comparisons = cmp_mm_foxn1het,
+    sets =  sets_mm[TEC_SIG_ORDER],
+    dat_camera = dat_camera_mm
+)
+p_mm_foxn1het_lines
+fig_pdf(FIGS, p_mm_foxn1het_lines)
+save_sourcedata(p_mm_foxn1het_lines, file.path(FIGS, "fig2d_edf7b.xlsx"))
+```
+
+```{r, fig_mm_foxn1het_hm, fig.height = 2.6, fig.width = w_hm(cmp_mm_foxn1het)}
+p_mm_foxn1het_hm <- plt_camera_hm(
+    dat_camera_mm,
+    comparisons = cmp_mm_foxn1het,
+    sets = TEC_SIG_ORDER
+)
+p_mm_foxn1het_hm <- p_mm_foxn1het_hm +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5))
+p_mm_foxn1het_hm
+fig_pdf(FIGS, p_mm_foxn1het_hm)
+```
+
+
+<!-- ---------------------------------------------------------------------- -->
+
+
+# M. musculus - Cardinal
+
+Comparisons involving Cardinal
+
+```{r}
+cmp_mm_card <- c(
+    "cardPos-vs-cardNeg"
+)
+```
+
+```{r, supp_mm_card_camtop, fig.height = 3, fig.width = 5}
+for (cmp_ in cmp_mm_card) {
+    p_ <- plt_camera_top(dat_camera_mm, cmp_)
+    print(p_)
+    fig_pdf(FIGS, p_, suffix = cmp_)
+}
+```
+
+```{r, fig_mm_card_lines, fig.height = 2, fig.width = 2.4}
+p_mm_card_lines <- plt_barcode(
+    dat_limma_mm,
+    comparisons = cmp_mm_card,
+    sets =  sets_mm[TEC_SIG_ORDER],
+    dat_camera = dat_camera_mm
+)
+p_mm_card_lines
+fig_pdf(FIGS, p_mm_card_lines)
+save_sourcedata(p_mm_card_lines, file.path(FIGS, "fig2h_edf7f.xlsx"))
+```
+
+```{r, fig_mm_card_hm, fig.height = 2.6, fig.width = w_hm(cmp_mm_card)}
+p_mm_card_hm <- plt_camera_hm(
+    dat_camera_mm,
+    comparisons = cmp_mm_card,
+    sets = TEC_SIG_ORDER
+)
+p_mm_card_hm  <- p_mm_card_hm +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5))
+p_mm_card_hm
+fig_pdf(FIGS, p_mm_card_hm)
+```
+
+
+<!-- ---------------------------------------------------------------------- -->
+
+
+# M. musculus - Fgf7
+
+Comparisons involving Fgf7
+
+```{r}
+cmp_mm_fgf7 <- c(
+    "Fgf7wt-vs-WT",
+    "Fgf7het-vs-WT"
+)
+```
+
+```{r, supp_mm_fgf7_camtop, fig.height = 3, fig.width = 5}
+for (cmp_ in cmp_mm_fgf7) {
+    p_ <- plt_camera_top(dat_camera_mm, cmp_)
+    print(p_)
+    fig_pdf(FIGS, p_, suffix = cmp_)
+}
+```
+
+```{r, fig_mm_fgf7_lines, fig.height = 2, fig.width = 4}
+p_mm_fgf7_lines <- plt_barcode(
+    dat_limma_mm,
+    comparisons = cmp_mm_fgf7,
+    sets =  sets_mm[TEC_SIG_ORDER],
+    dat_camera = dat_camera_mm
+)
+p_mm_fgf7_lines
+fig_pdf(FIGS, p_mm_fgf7_lines)
+save_sourcedata(p_mm_fgf7_lines, file.path(FIGS, "fig2f_edf7e.xlsx"))
+```
+
+```{r, fig_mm_fgf7_hm, fig.height = 3, fig.width = w_hm(cmp_mm_fgf7)}
+p_mm_fgf7_hm <- plt_camera_hm(
+    dat_camera_mm,
+    comparisons = cmp_mm_fgf7,
+    sets = TEC_SIG_ORDER
+)
+p_mm_fgf7_hm
+fig_pdf(FIGS, p_mm_fgf7_hm)
+```
+
+
+<!-- ---------------------------------------------------------------------- -->
+
+
+# M. musculus - Foxn1 KO
+
+Comparisons with Foxn1KO
+
+```{r}
+cmp_mm_foxn1ko <- c(
+    "Foxn1KO-vs-WT"
+)
+```
+
+```{r, supp_mm_foxn1ko_camtop, fig.height = 3, fig.width = 5.5}
+for (cmp_ in cmp_mm_foxn1ko) {
+    p_ <- plt_camera_top(dat_camera_mm, cmp_)
+    print(p_)
+    fig_pdf(FIGS, p_, suffix = cmp_)
+}
+```
+
+```{r, supp_mm_foxn1ko_lines, fig.height = 2, fig.width = 2.4}
+p_mm_foxn1ko_lines <- plt_barcode(
+    dat_limma_mm,
+    comparisons = cmp_mm_foxn1ko,
+    sets =  sets_mm[TEC_SIG_ORDER],
+    dat_camera = dat_camera_mm
+)
+p_mm_foxn1ko_lines
+fig_pdf(FIGS, p_mm_foxn1ko_lines)
+save_sourcedata(p_mm_foxn1ko_lines, file.path(FIGS, "fig4a_edf9a.xlsx"))
+```
+
+```{r, fig_mm_foxn1ko_hm, fig.height = 2.6, fig.width = w_hm(cmp_mm_foxn1ko)}
+p_mm_foxn1ko_hm <- plt_camera_hm(
+    dat_camera_mm,
+    comparisons = cmp_mm_foxn1ko,
+    sets = TEC_SIG_ORDER,
+    col_lim = 30
+)
+p_mm_foxn1ko_hm <- p_mm_foxn1ko_hm +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5))
+p_mm_foxn1ko_hm
+fig_pdf(FIGS, p_mm_foxn1ko_hm)
+```
+
+
+<!-- ---------------------------------------------------------------------- -->
+
+
+# M. musculus - Amphioxus
+
+Comparisons involving Amphioxus Foxn4.
+
+```{r}
+cmp_mm_amphioxus <- c(
+    "AF4-vs-WT"
+)
+```
+
+Top camera hits together with shark (below).
+
+```{r, fig_mm_amphioxus_hm, fig.height = 3, fig.width = w_hm(cmp_mm_amphioxus)}
+p_mm_amphioxus_hm <- plt_camera_hm(
+    dat_camera_mm,
+    comparisons = cmp_mm_amphioxus,
+    sets = TEC_SIG_ORDER,
+    col_lim = 30
+)
+p_mm_amphioxus_hm
+fig_pdf(FIGS, p_mm_amphioxus_hm)
+```
+
+```{r, supp_mm_amphioxus_lines, fig.height = 2, fig.width = 2}
+p_mm_amphioxus_lines <- plt_barcode(
+    dat_limma_mm,
+    comparisons = cmp_mm_amphioxus,
+    sets =  sets_mm[TEC_SIG_ORDER],
+    dat_camera = dat_camera_mm
+)
+p_mm_amphioxus_lines
+fig_pdf(FIGS, p_mm_amphioxus_lines)
+save_sourcedata(p_mm_amphioxus_lines, file.path(FIGS, "fig5h_edf11c.xlsx"))
+```
+
+
+<!-- ---------------------------------------------------------------------- -->
+
+
+# M. musculus - Shark
+
+Comparisons involving shark Foxn versions.
+
+```{r}
+cmp_mm_shark <- c(
+    "cmF4-vs-WT",
+    "cmF1-vs-WT",
+    "cmdtgF1F4-vs-WT",
+    "cmF4-vs-cmF1"
+)
+cmp_mm_ancient <- c(cmp_mm_amphioxus, cmp_mm_shark)
+```
+
+```{r, supp_mm_shark_lines, fig.height = 2, fig.width = 180 / 25.4}
+p_mm_shark_lines <- plt_barcode(
+    dat_limma_mm,
+    comparisons = cmp_mm_shark,
+    sets =  sets_mm[TEC_SIG_ORDER],
+    dat_camera = dat_camera_mm
+)
+p_mm_shark_lines$facet$params$ncol <- 4
+p_mm_shark_lines
+fig_pdf(FIGS, p_mm_shark_lines)
+save_sourcedata(p_mm_shark_lines, file.path(FIGS, "fig5f_edf10d.xlsx"))
+```
+
+```{r, fig_mm_shark_hm, fig.height = 3, fig.width = w_hm(cmp_mm_shark)}
+p_mm_shark_hm <- plt_camera_hm(
+    dat_camera_mm,
+    comparisons = cmp_mm_shark,
+    sets = TEC_SIG_ORDER,
+    col_lim = 30
+)
+p_mm_shark_hm
+fig_pdf(FIGS, p_mm_shark_hm)
+```
+
+
+```{r, supp_mm_ancient_camtop, fig.height = 3, fig.width = 5.5}
+# amphioxus and shark = ancient
+for (cmp_ in cmp_mm_ancient) {
+    p_ <- plt_camera_top(dat_camera_mm, cmp_)
+    print(p_)
+    fig_pdf(FIGS, p_, suffix = cmp_)
+}
+```
+
+<!-- ---------------------------------------------------------------------- -->
+
+
+# M. musculus - Chimera6
+
+Comparisons involving Chimera 6
+
+```{r}
+cmp_mm_chi6 <- c(
+    "chi6.down-vs-FVB.WT",
+    "chi6.up-vs-FVB.WT"
+)
+```
+
+```{r, supp_mm_chi6_camtop, fig.height = 3, fig.width = 5.5}
+for (cmp_ in cmp_mm_chi6) {
+    p_ <- plt_camera_top(dat_camera_mm, cmp_)
+    print(p_)
+    fig_pdf(FIGS, p_, suffix = cmp_)
+}
+```
+
+```{r, supp_mm_chi6_lines, fig.height = 2.5, fig.width = 4}
+p_mm_chi6_lines <- plt_barcode(
+    dat_limma_mm,
+    comparisons = cmp_mm_chi6,
+    sets =  sets_mm[TEC_SIG_ORDER],
+    dat_camera = dat_camera_mm
+)
+p_mm_chi6_lines
+fig_pdf(FIGS, p_mm_chi6_lines)
+save_sourcedata(p_mm_chi6_lines, file.path(FIGS, "fig3f_edf8b.xlsx"))
+```
+
+```{r, fig_mm_chi6_hm, fig.height = 3, fig.width = w_hm(cmp_mm_chi6)}
+p_mm_chi6_hm <- plt_camera_hm(
+    dat_camera_mm,
+    comparisons = cmp_mm_chi6,
+    sets = TEC_SIG_ORDER
+)
+p_mm_chi6_hm
+fig_pdf(FIGS, p_mm_chi6_hm)
+```
+
+```{r fig_mm_chi6_pca, fig.height = 1, fig.width = 3.8}
+v_mm_chi6 <- v_mm[, v_mm$target$condition %in% c("chi6.up", "chi6.down")]
+chi6_mds <- plotMDS(v_mm_chi6, gene.selection = "common", top = Inf, plot = FALSE)
+dat_mm_chi6_pca <- data.frame(
+    sample = colnames(v_mm_chi6),
+    PC1 = chi6_mds$x,
+    PC2 = chi6_mds$y)
+dat_mm_chi6_pca <- left_join(dat_mm_chi6_pca, v_mm_chi6$target)
+p_chi6_pca <- ggplot(dat_mm_chi6_pca, aes(PC1, PC2, color = condition)) +
+    # geom_text(aes(label = sample)) +
+    geom_point() +
+    labs(
+        x = sprintf("PC1 (%.1f%%)", chi6_mds$var.explained[1] * 100),
+        y = sprintf("PC2 (%.1f%%)", chi6_mds$var.explained[2] * 100)
+    ) +
+    coord_fixed(ratio = chi6_mds$var.explained[2] / chi6_mds$var.explained[1]) +
+    theme(legend.position = "bottom") +
+    scale_y_continuous(limits = c(-1.5, 1.5)) +
+    scale_color_manual(name = NULL, labels = LBL_GROUP, values = COL_CHI6)
+p_chi6_pca
+
+write.table(
+    dat_mm_chi6_pca[c("sample", "group", "PC1", "PC2")],
+    file.path(FIGS, "tbl_chi6_pca.tsv"),
+    sep = "\t",
+    row.names = FALSE)
+fig_pdf(FIGS, p_chi6_pca)
+```
+
+
+# D. rerio
+
+
+## Enrichment - Overall
+
+```{r supp_dr_cam_all, fig.height = 3, fig.width = 1.6}
+p_dr_cam_all <- plt_camera_overall(dat_camera_dr) +
+    theme(
+        axis.text.x = element_text(angle = 0, hjust = 0.5),
+        legend.direction = "vertical"
+    ) +
+    guides(color = guide_legend(override.aes = list(size = 2), ncol = 2))
+p_dr_cam_all
+fig_pdf(FIGS, p_dr_cam_all)
+```
+
+```{r supp_dr_camtop_foxn1ko-vs-wt, fig.height = 3, fig.width = 5}
+p_dr_camtop <- plt_camera_top(dat_camera_dr)
+p_dr_camtop
+fig_pdf(FIGS, p_dr_camtop)
+```
+
+
+## Enrichment - TEC sets
+
+```{r supp_dr_lines, fig.height = 2, fig.width = 2}
+p_dr_lines <- plt_barcode(
+    dat_limma_dr,
+    comparisons = NULL,
+    sets = sets_dr[TEC_SIG_ORDER],
+    dat_camera_dr
+)
+p_dr_lines
+fig_pdf(FIGS, p_dr_lines)
+save_sourcedata(p_dr_lines, file.path(FIGS, "fig5g_edf11a.xlsx"))
+```
+
+```{r supp_dr_hm, fig.height = 2, fig.width = w_hm(comparisons_dr)}
+p_dr_hm <- plt_camera_hm(
+    dat_camera_dr,
+    sets = TEC_SIG_ORDER
+)
+p_dr_hm <- p_dr_hm +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_dr_hm
+fig_pdf(FIGS, p_dr_hm)
+```
+
+<!-- all chunks below create and save figures with arrangements used in the
+paper. While individual panels for groups of comparisons are all generated above,
+it proved easier to do some arrangements semi-automatically here instead of
+manually in graphics software. -->
+
+```{r fig1ab, fig.width = 140 / 25.4, fig.height = 2.5}
+fig1ab <- p_mm_devel_lines + theme(plot.margin = margin(0, 1, 0, 0, "cm")) +
+    p_mm_devel_hm +
+    plot_layout(widths = c(6, 1))
+fig_pdf(FIGS, fig1ab)
+```
+
+```{r fig2defh, fig.width = 180 / 25.4, fig.height = 2.5}
+fig2def <- p_mm_foxn1het_hm + theme(plot.margin = margin(0, 1, 0, 0, "cm")) +
+    p_mm_ba_hm + theme(plot.margin = margin(0, 1, 0, 0, "cm")) +
+    p_mm_fgf7_hm + theme(plot.margin = margin(0, 1, 0, 0, "cm")) +
+    p_mm_card_hm +
+    plot_layout(ncol = 4, guides = "collect", widths = c(1, 2, 2, 1))
+fig_pdf(FIGS, fig2def)
+```
+
+```{r fig5fgh, fig.width = 180 / 25.4, fig.height = 2.5}
+fig5fgh <- p_mm_shark_hm + theme(plot.margin = margin(0, 2, 0, 0, "cm")) +
+    p_dr_hm + theme(plot.margin = margin(0, 2, 0, 0, "cm")) +
+    p_mm_amphioxus_hm +
+    plot_layout(ncol = 3, guides = "keep", widths = c(4, 1, 1))
+fig_pdf(FIGS, fig5fgh)
+```
+
+```{r edf7abc, fig.width = 180 / 25.4, fig.height = 2}
+edf7abc <- p_mm_strains_lines + theme(plot.margin = margin(0, 0.5, 0, 0, "cm")) +
+    p_mm_foxn1het_lines + theme(axis.text.y = element_blank(), plot.margin = margin(0, 0.5, 0, 0, "cm")) +
+    p_mm_ba_lines + theme(axis.text.y = element_blank()) +
+    plot_layout(ncol = 3, widths = c(1, 1, 2))
+fig_pdf(FIGS, edf7abc)
+```
+
+```{r edf7ef, fig.width = 140 / 25.4, fig.height = 2}
+edf7ef <- p_mm_fgf7_lines + theme(plot.margin = margin(0, 0.5, 0, 0, "cm")) +
+    p_mm_card_lines + theme(axis.text.y = element_blank(), plot.margin = margin(0, 0.5, 0, 0, "cm")) +
+    plot_layout(ncol = 2, widths = c(2, 1))
+fig_pdf(FIGS, edf7ef)
+```
+
+```{r}
+#' Combine multiple plots showing top hits from camera
+#' @param p_list a list of plots, each produced by `plt_camera_top`
+combine_camera_top <- function(p_list, ncol = 2) {
+    wrap_plots(p_list) +
+        plot_layout(ncol = ncol, axis_titles = "collect") &
+        theme(
+            plot.tag = element_text(size = 7, face = "bold"),
+            plot.title = element_blank(),
+            axis.text.y = element_text(size = 3),
+            plot.margin = margin(0.5, 1, 1, 1, "mm")
+        )
+}
+```
+
+```{r suppf2, fig.width = 6.5, fig.height = 2}
+suppf2 <- combine_camera_top(list(
+    plt_camera_top(dat_camera_mm, "E15-vs-P28") + labs(tag = "a"),
+    plt_camera_top(dat_camera_mm, "P1-vs-P28") + labs(tag = "b")
+), ncol = 2)
+fig_pdf(FIGS, suppf2)
+```
+
+```{r suppf4, fig.width = 6.5, fig.height = 6}
+suppf4 <- combine_camera_top(list(
+    plt_camera_top(dat_camera_mm, "PWK.WT-vs-B6.WT") + labs(tag = "a"),
+    plt_camera_top(dat_camera_mm, "Foxn1het-vs-WT") + labs(tag = "b"),
+    plt_camera_top(dat_camera_mm, "Bmp4-vs-WT") + labs(tag = "c"),
+    plt_camera_top(dat_camera_mm, "Ascl1KO-vs-WT"),
+    plt_camera_top(dat_camera_mm, "Fgf7wt-vs-WT") + labs(tag = "d"),
+    plt_camera_top(dat_camera_mm, "Fgf7het-vs-WT")
+), ncol = 2)
+fig_pdf(FIGS, suppf4)
+```
+
+```{r suppf5, fig.width = 3.5, fig.height = 4.5}
+suppf5 <- combine_camera_top(list(
+    plt_camera_top(dat_camera_mm, "cardPos-vs-cardNeg") + labs(tag = "a"),
+    plt_camera_top(dat_camera_mm, "chi6.down-vs-FVB.WT") + labs(tag = "b"),
+    plt_camera_top(dat_camera_mm, "chi6.up-vs-FVB.WT") + labs(tag = "c")
+), ncol = 1)
+fig_pdf(FIGS, suppf5)
+```
+
+```{r suppf6, fig.width = 6.5, fig.height = 6}
+suppf6 <- combine_camera_top(list(
+    plt_camera_top(dat_camera_mm, "Foxn1het-vs-WT") + labs(tag = "a"),
+    plt_camera_top(dat_camera_mm, "AF4-vs-WT"),
+    plt_camera_top(dat_camera_mm, "cmF4-vs-WT"),
+    plt_camera_top(dat_camera_mm, "cmF1-vs-WT"),
+    plt_camera_top(dat_camera_mm, "cmdtgF1F4-vs-WT"),
+    plt_camera_top(dat_camera_dr, "DR.Foxn1KO-vs-DR.WT") + labs(tag = "b")
+))
+fig_pdf(FIGS, suppf6)
+```

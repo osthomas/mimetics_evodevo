@@ -1,0 +1,7 @@
+sample	condition	file
+BK1	WT	BK1.tsv
+BK2	WT	BK2.tsv
+BK3	WT	BK3.tsv
+BK4	Foxn1KO	BK4.tsv
+BK5	Foxn1KO	BK5.tsv
+BK6	Foxn1KO	BK6.tsv

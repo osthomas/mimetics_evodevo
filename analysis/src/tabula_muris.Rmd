@@ -1,0 +1,178 @@
+---
+title: Mimetic signatures in Tabula Muris Lung Tissue
+date: "`r Sys.Date()`"
+---
+
+Investigate scoring and assignment of mimetics signatures in Tabula Muris Lung
+Tissue.
+
+
+```{r packages, message = FALSE}
+library(scran)
+library(scuttle)
+library(scater)
+devtools::load_all(file.path(ROOT, "R"))
+```
+
+
+```{r}
+cts <- read.table(
+    file.path(ROOT, "data", "tabula_muris", "FACS", "Lung-counts.csv"),
+    row.names = 1, header = TRUE,
+    sep = ","
+)
+meta <- read.csv(
+    file.path(ROOT, "data", "tabula_muris", "annotations_facs.csv"),
+)
+meta <- meta[meta$cell %in% colnames(cts), ]
+cts <- as.matrix(cts)
+# Parse metadata from identifiers
+meta <- data.frame(cell = colnames(cts)) %>%
+    separate_wider_delim(
+        cell,
+        delim = ".",
+        names = c("well", "plate.barcode", "mouse.id", NA, NA),
+        cols_remove = FALSE
+    )
+# Get metadata from T. muris
+meta_tm <- read.csv(
+    file.path(ROOT, "data", "tabula_muris", "annotations_facs.csv"),
+)
+# Combine
+meta <- left_join(meta, meta_tm)
+
+sce_tm <- SingleCellExperiment(assays = list(counts = cts), colData = meta)
+```
+
+```{r metadata}
+```
+
+```{r}
+qcstats <- perCellQCMetrics(sce_tm)
+qcfilter <- quickPerCellQC(qcstats)
+sce_tm <- sce_tm[, !qcfilter$discard]
+clusters <- quickCluster(sce_tm)
+sce_tm <- computeSumFactors(sce_tm, clusters = clusters)
+summary(sizeFactors(sce_tm))
+sce_tm <- logNormCounts(sce_tm)
+
+plot(
+    librarySizeFactors(sce_tm), sizeFactors(sce_tm),
+    xlab = "Library size factors", ylab = "Deconvolution factors",
+    col = rainbow(length(unique(sce_tm$plate.barcode)))[as.integer(as.factor(sce_tm$plate.barcode))],
+    log = "xy")
+
+dec <- modelGeneVar(sce_tm)
+plot(dec$mean, dec$total, xlab="Mean log-expression", ylab="Variance")
+curve(metadata(dec)$trend(x), col="blue", add=TRUE)
+chosen.hvgs <- getTopHVGs(sce_tm, prop = 0.1)
+sce_tm <- runPCA(sce_tm, subset_row=chosen.hvgs)
+sce_tm <- runUMAP(sce_tm, dimred = "PCA", min_dist = 0.3)
+```
+
+# Comparative AUCell
+
+Run AUCell on the Tabula Muris Lung data and the TEC data, using the mimetic
+Ciliated signature and the Ciliated signature from TM.
+
+```{r}
+sce <- readRDS(file.path(ROOT, "pipeline", "sce_integrated.rds"))
+# For TECs: get assigned signature
+sce_assigned <- readRDS(file.path(ROOT, "pipeline", "sce_integrated_mimetics.rds"))
+m <- match(colnames(sce), colnames(sce_assigned))
+sce$final_signature <- sce_assigned$signature[m]
+sce$source <- "TECs"
+# Harmonize column name
+
+# For TM: get original cluster label
+sce_tm$source <- "TM_FACS"
+sce_tm$final_signature <- sce_tm$cell_ontology_class
+sce_tm$transcriptome <- sce_tm$cell
+
+# Restrict to common gene universe
+universe <- intersect(rownames(sce), rownames(sce_tm))
+sce <- sce[universe, ]
+sce_tm <- sce_tm[universe, ]
+
+markers <- readRDS(file.path(ROOT, "pipeline", "markers.rds"))
+markers_tmuris <- readRDS(file.path(ROOT, "pipeline", "markers_tmuris.rds"))
+eq_sets <- c(
+    "Ciliated" = "TM:Lung.ciliated columnar cell of tracheobronchial tree"
+)
+sets <- c(
+    markers[names(eq_sets)],
+    markers_tmuris[eq_sets]
+)
+```
+
+The gene sets are not the same size:
+
+```{r}
+lengths(sets)
+```
+
+Downsample the larger signature multiple times randomly to the smaller size to
+get a range of possible AUC values.
+
+```{r}
+set.seed(1)
+sets <- lapply(seq_along(eq_sets), function(i) {
+    set <- c(sets[eq_sets[i]], sets[names(eq_sets)[i]])
+    larger <- which.max(lengths(set))
+    smaller <- which.min(lengths(set))
+    n_rep <- 100
+    larger_downsamp <- replicate(n_rep, {sample(set[[larger]], min(lengths(set)))}, simplify = FALSE)
+    names(larger_downsamp) <- paste(names(set)[larger], seq_len(n_rep), sep = "::")
+    c(set[smaller], larger_downsamp)
+})
+sets <- unlist(sets, recursive = FALSE)
+```
+
+```{r}
+sces <- list(
+    tm = sce_tm,
+    tecs = sce
+)
+auc_tbls <- lapply(sces, function(sce) {
+    auc <- mimetics::run_aucell(
+            sce,
+            sets,
+            mimetics::AUCELL_MAX_RANK,
+            thresholds = list()  # no assignment necessary
+    )
+    tbl <- auc$tbl
+    tbl
+})
+dat <- bind_rows(auc_tbls) %>%
+    separate_wider_delim(signature, "::", names = c("signature", "rep"), too_few = "align_start") %>%
+    mutate(rep = ifelse(is.na(rep), 1, rep)) %>%
+    group_by(transcriptome, final_signature, source, signature) %>%
+    summarize(auc_sd = sd(auc), auc = mean(auc))
+
+```
+
+```{r}
+plt_scatter <- function(dat, x, y) {
+    dat <- filter(dat, signature %in% c(x, y))
+    dat[dat[["signature"]] == x, "signature"] <- "x"
+    dat[dat[["signature"]] == y, "signature"] <- "y"
+    dat <- dat %>%
+        pivot_wider(
+            id_cols = c(transcriptome, final_signature, source),
+            names_from = signature,
+            values_from = c(auc, auc_sd)
+        )
+    dat[["name_x"]] <- x
+    dat[["name_y"]] <- y
+    dat
+    ggplot(dat, aes(auc_x, auc_y, color = source)) +
+        geom_point() +
+        geom_errorbar(aes(ymin = auc_y - auc_sd_y, ymax = auc_y + auc_sd_y)) +
+        facet_wrap(~final_signature, ncol = 9) +
+        geom_abline(slope = 1) +
+        coord_fixed() +
+        labs(x = x, y = y)
+}
+sc <- plt_scatter(dat, "Ciliated", "TM:Lung.ciliated columnar cell of tracheobronchial tree")
+sc
+```

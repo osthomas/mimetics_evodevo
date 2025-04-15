@@ -1,0 +1,397 @@
+---
+title: Identification of cell populations via signatures
+date: "`r Sys.Date()`"
+params:
+    input_markers: NULL
+    input_sce_universe: NULL
+    input_sce_all: NULL
+    output_sce_universe: NULL
+    output_sce_all: NULL
+    output_tbl: NULL
+---
+
+```{r setup, message = FALSE}
+stopifnot(!any(sapply(params, is.null)))
+
+library(tidyverse)
+library(scater)
+library(AUCell)
+library(ComplexHeatmap)
+devtools::load_all(file.path(ROOT, "R"))
+
+# Plot helpers
+# Color facets with unbarcoded samples
+shade_barcoded <- list(
+    geom_rect(
+        inherit.aes = FALSE, data = function(d) {
+            d %>% filter(!barcoded) %>% select(sample, genotype, timepoint) %>% distinct()
+        },
+        xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = "gray90"
+    ),
+    labs(subtitle = "Shaded panels are from unbarcoded mice")
+)
+# Blank labels for some facetting variables
+label_blank <- function(x) ""
+max_rank <- mimetics::AUCELL_MAX_RANK
+```
+
+> **Note**: Some helper functions and parameters are defined in `R/R/aucell.R`
+
+
+```{r load-data}
+# Load data that was reduced to the common gene universe
+sce_universe <- readRDS(file.path(ROOT, params$input_sce_universe))
+# Load data that kept all genes
+sce_all <- readRDS(file.path(ROOT, params$input_sce_all))
+# Load previously defined markers
+markers <- readRDS(file.path(ROOT, params$input_markers))
+# Some of the marker sets are not interesting for our purposes
+uninteresting_labels <- c(
+    "adult_cTEC",
+    "immature",
+    "perinatal_cTEC",
+    "transit_amplifying"
+)
+is_uninteresting <- names(markers) %in% uninteresting_labels
+markers <- markers[!is_uninteresting]
+# Only look at mimetic signatures, not the original populations
+is_pop <- names(markers) %in% c("mTEC", "cTEC", "early_progenitor", "postnatal_progenitor")
+markers_mimetics <- markers[!is_pop]
+markers_populations <- markers[is_pop]
+```
+
+# Similarity of signatures
+
+Marker gene sets were defined as follows:
+
+`r enframe(markers, name = "set", value = "gene") %>% unnest(gene)`
+
+How unique are the gene sets comprising the marker signatures? What fraction of
+the genes of **signature.x** are also in **signature.y**?
+
+```{r signature-unique, fig.width = 6, fig.height = 6}
+# presence/absence table of genes in signatures
+sig_genes <- enframe(markers, name = "signature", value = "genes") %>%
+    unnest(genes) %>%
+    with(., table(genes, signature) > 0)
+sig_xiny <- sapply(seq_len(ncol(sig_genes)), function(x) {
+    sapply(seq_len(ncol(sig_genes)), function(y) {
+        # intersect of genes in x and y
+        isec <- sum(sig_genes[, x] & sig_genes[, y])
+        # number of genes in x
+        n_x <- sum(sig_genes[, x])
+        isec / n_x
+    })
+})
+# row index corresponds signature 'y'
+# column index corresponds to signature 'x'
+rownames(sig_xiny) <- colnames(sig_xiny) <- colnames(sig_genes)
+sig_xiny <- as.data.frame.table(sig_xiny)
+colnames(sig_xiny) <- c("signature.y", "signature.x", "frac_x_in_y")
+
+ggplot(sig_xiny, aes(signature.x, signature.y, fill = frac_x_in_y)) +
+    geom_tile() +
+    scale_fill_viridis_c() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1), aspect.ratio = 1)
+```
+
+* Tuft1 and Tuft2 are actually quite distinct, but result in identification of
+  similar cells (see assignments below)
+* Skin_basal and Skin_keratinized are quite similar
+* Goblet and Lung_basal are somewhat similar
+
+
+
+# Identification of cell populations
+
+To classify expression of gene sets, AUCell is used (Aibar et al., Nat. Methods
+2017).
+
+AUCells assigns signature gene sets according to the following workflow:
+
+1. Genes are *ranked* by expression (raw counts) in each cell. Ranks are
+   independent of gene expression units and normalization, etc.
+2. For each cell and each gene set, determine the *recovery curve*. The
+   recovery curve plots the *Gene rank* on the x axis, and the *Cumulative
+   count of these genes which belong to the gene set of interest* on the y
+   axis. AUCell considers the top *N* genes expressed in a cell for ranking. N
+   was set to `r max_rank` for this analysis, based on the number of
+   expressed genes per cell.
+3. For each gene set, a threshold is set for the area under the recovery curve
+   (AUC).
+4. Cells are said to express a gene set if their AUC for a gene set is above
+   the threshold.
+
+Number of considered genes for construction of the AUC is marked on the gene
+count histogram.
+
+
+## Thresholds
+
+For assignment of a signature to a cell, the AUC values must be thresholded.
+
+AUCell makes suggestions for thresholds. These were manually adjusted according
+to the following criteria:
+
+1. Assumed "large populations", ie. Aire-stage: Relatively lenient threshold,
+   ideally splitting a "bimodal" distribution. Not all of these signature
+   distributions are bimodal.
+2. Assumed "small populations", ie. Ciliated, EnteroHepato, Goblet, Ionocyte,
+   Lung_basal, Microfold, Muscle, Neuroendocrine, Pancreatic, Skin_basal,
+   Skin_keratinized, Tuft1, Tuft2: strict threshold, akin to FACS cytokine
+   staining.
+
+It is possible for a cell to reach the threshold value of more than one
+signature. This is shown by the colors in the histogram.
+
+There are several conceivable strategies to handle such cases:
+
+1. Ignore ambiguous cells
+2. Assign the signature with the highest (scaled) AUC
+3. Assign all signatures which pass the threshold
+4. **Currently:** Rank signatures which pass the threshold
+   1. Rank cell AUC within signature (ie. position on the AUC histogram: The
+      further right a cell is, the higher its rank). The further right a cell
+      is, the clearer that signature is detected. The clearest signature wins.
+   2. If there are ties, look at scaled AUCs of all signatures within the cell
+      (analogous to *2.*).
+
+The numbers in the histograms signify "assigned cells / cells above threshold".
+
+
+```{r gene-count-hist, fig.width = 5, fig.height = 5}
+max_rank <- mimetics::AUCELL_MAX_RANK
+plotGeneCount(counts(sce_universe))
+abline(v = max_rank, col = "red", lwd = 2)
+```
+
+
+```{r aucell-helper-funs}
+# make namespacing explicit for future readers
+run_aucell <- mimetics::run_aucell
+```
+
+
+```{r plotting-helpers}
+signature_labels <- sapply(markers, length)
+signature_labels <- sprintf("%s\n(%d genes)", names(signature_labels), signature_labels)
+names(signature_labels) <- names(markers)
+signature_labels <- as_labeller(signature_labels)
+plt_aucell_jaccard <- mimetics::plt_aucell_jaccard
+```
+
+
+## Identification of mimetic populations
+```{r aucell-mimetics, warning = FALSE}
+thresholds_mimetics <- mimetics::THRESHOLDS_MIMETICS
+aucell_mimetics <- run_aucell(sce_universe, markers_mimetics, max_rank, thresholds_mimetics)
+```
+
+
+### AUC Histograms
+
+```{r auc-thresholds-mimetics, message = FALSE, fig.width = 10, fig.height = 12}
+p_auc_hist <- ggplot(aucell_mimetics$tbl) +
+    geom_histogram(bins = 64, aes(x = auc, fill = factor(thresholds_reached))) +
+    stat_summary(
+        aes(x = threshold, xintercept = after_stat(x), y = 0),
+        fun = mean,
+        orientation = "y",
+        geom = "vline",
+        color = "brown",
+    ) +
+    stat_summary_panel(
+        geom = "text",
+        aes(above_threshold = above_threshold, threshold = threshold, assigned = assigned),
+        fun = function(dat) {
+            above <- sum(dat$above_threshold)
+            assigned <- sum(dat$assigned)
+            label <- sprintf("%d/%d", assigned, above)
+            data.frame(
+                x = Inf,
+                y = Inf,
+                label = label
+            )
+        },
+        vjust = 2, hjust = 1.2
+    ) +
+    scale_fill_viridis_d() +
+    facet_wrap(
+        ~signature,
+        labeller = signature_labels,
+        scales = "free",
+        ncol = 4) +
+    labs(title = "Thresholds for assignment of signatures", subtitle = "Overall") +
+    theme(legend.position = "bottom")
+p_auc_hist
+```
+
+```{r auc-thresholds-mimetics-indiv, message = FALSE, fig.width = 14, fig.asp = 0.6}
+p_auc_hist_indiv <- p_auc_hist +
+    facet_grid(
+        timepoint + genotype + sample ~ signature,
+        labeller = labeller(signature = signature_labels),
+        scales = "free") +
+    labs(subtitle = "By sample")
+p_auc_hist_indiv
+```
+
+
+### Heatmap of AUCs
+
+In this heatmap, each row is a gene signature, and each column is one cell.
+Colors represent the AUC of each signature for each cell, scaled per signature.
+
+It is evident that some cells could be considered positive for multiple
+signatures.
+
+```{r auc-heatmap, message = FALSE, fig.width = 8, fig.height = 5}
+mimetic_auc_matrix <- aucell_mimetics$tbl %>%
+    pivot_wider(id_cols = signature, names_from = transcriptome, values_from = auc_zscore) %>%
+    column_to_rownames("signature") %>%
+    as.matrix()
+Heatmap(mimetic_auc_matrix,
+    heatmap_legend_param = list(title = "AUC (scaled)"),
+    col = viridis_scale(
+        low = quantile(mimetic_auc_matrix, 0.01),
+        high = quantile(mimetic_auc_matrix, 0.99)),
+    show_column_names = FALSE,
+    show_column_dend = FALSE)
+```
+
+
+### Cells reaching multiple thresholds - collapse redundant signatures
+
+Some cells reach the threshold for multiple signatures.
+
+Several signatures are above threshold for an overlapping set of cells (eg.
+Tuft1 and Tuft2), see previous heatmap. Look at the Jaccard indices for each
+pairing to determine which signatures can be collapsed into one.
+
+```{r redundant-mimetics, fig.width = 5, fig.height = 5}
+jaccard_mimetics <- plt_aucell_jaccard(aucell_mimetics$tbl)
+jaccard_mimetics
+```
+
+Based on these results, collapse:
+
+* Skin_keratinized and Skin_basal
+* Tuft1 and Tuft2
+
+```{r collapse-signatures}
+aucell_mimetics$sce$signature <- forcats::fct_collapse(aucell_mimetics$sce$signature,
+    Tuft = c("Tuft1", "Tuft2"),
+    Skin = c("Skin_keratinized", "Skin_basal")
+)
+aucell_mimetics$sce$cell_type <- ifelse(
+    aucell_mimetics$sce$signature == "no_signature",
+    as.character(aucell_mimetics$sce$label_fine),
+    as.character(aucell_mimetics$sce$signature)
+)
+```
+
+
+### Overlay of aggregated expression per signature on UMAPs
+
+Here, each cell is color-coded according to the average expression of all genes
+in the respective signature gene set. All averages were scaled between 0
+(in cell with lowest average expression) and 1 (in cell with highest average
+expression) for all signatures to plot them on the same color scale.
+
+```{r overlay-expression, fig.width = 20, fig.asp = 11/16, dpi = 150}
+# Aggregate counts across marker genes which are in the data
+markers_in_data <- lapply(markers, function(x) x[x %in% rownames(sce_universe)])
+# Respect collapsed signatures
+markers_in_data[["Skin"]] <- Reduce(union, markers_in_data[c("Skin_keratinized", "Skin_basal")])
+markers_in_data[["Tuft"]] <- Reduce(union, markers_in_data[c("Tuft1", "Tuft2")])
+markers_in_data[c("Skin_keratinized", "Skin_basal", "Tuft1", "Tuft2")] <- NULL
+aggregated <- aggregateAcrossFeatures(
+    sce_universe,
+    ids = markers_in_data,
+    average = TRUE,
+    use.assay.type = "logcounts")
+dat_aggregated <- makePerCellDF(aggregated, features = names(markers_in_data)) %>%
+    pivot_longer(all_of(names(markers_in_data)), names_to = "signature", values_to = "avg") %>%
+    group_by(signature) %>%
+    mutate(avg = (avg - min(avg)), avg = avg / max(avg))
+
+p_agg <- ggplot(dat_aggregated, aes(UMAP_int.1, UMAP_int.2, color = avg)) +
+    shade_barcoded +
+    geom_point(size = 0.1) +
+    scale_color_viridis_c(name = "Normalized Avg. log(CP10K)") +
+    facet_grid(timepoint + genotype + sample ~ signature, labeller = labeller(sample = label_blank)) +
+    labs(title = "Average normalized expression of signatures") +
+    theme_umap
+p_agg
+```
+
+
+### Overlay of cells assigned to signatures on UMAPs
+
+Here, the cells with their assigned signature are overlaid onto the UMAP
+projections. The colors represent the labels assigned via the original RaceID
+analysis, black dots mark cells with assigned signatures as indicated in the
+panels. Numbers indicate cell count per panel.
+
+
+1. signature *Aire-stage* mostly overlaps with mTECs and mTEC adjacent
+   postnatal progenitors
+1. *Tuft* signature matches
+1. The remaining mimetic signatures mostly show up in mTECs in the 4 week WT
+   mice
+
+
+```{r mimetics-overlay, fig.width = 15, fig.asp = 11/13, dpi = 150}
+dat_overlay_mimetics <- makePerCellDF(aucell_mimetics$sce)
+
+p_overlay <- ggplot(dat_overlay_mimetics, aes(UMAP.1, UMAP.2)) +
+    shade_barcoded +
+    # Plot all points without the faceting variable as background
+    geom_point(data = ~transform(., signature = NULL), size = 0.1, aes(color = label)) +
+    geom_point(size = 0.1) +
+    stat_summary(
+        geom = "text",
+        aes(x = stage(1, after_stat = Inf)),
+        fun.data = function(x) {
+            n <- length(x)
+            data.frame(y = Inf, label = n)
+        },
+        vjust = 2, hjust = 1.2
+    ) +
+    scale_color_manual(values = COL_POPULATION) +
+    facet_grid(timepoint + genotype + sample ~ signature, drop = TRUE, labeller = labeller(sample = function(x) "")) +
+    theme_umap +
+    guides(color = guide_legend(override.aes = list(size = 2)))
+p_overlay
+```
+
+## Run AUCell with the larger populations
+
+```{r}
+aucell_pops <- run_aucell(sce_universe, markers_populations, max_rank, thresholds_mimetics)
+# Add AUCs for population to cells where the highest ranked signature agrees
+# with the original label and the cell type (ie., no mimetic signature matches)
+keep <- aucell_mimetics$sce$transcriptome[aucell_mimetics$sce$label == aucell_mimetics$sce$cell_type]
+pop_aucs <- aucell_pops$tbl %>%
+    filter(transcriptome %in% keep, assignment_rank == 1, signature == label)
+aucell_mimetics$sce[, pop_aucs$transcriptome]$auc <- pop_aucs$auc
+```
+
+# Transfer
+
+Transfer the annotations of mimetic cells from the dataset only comprising
+common genes (the `universe`) to the dataset with all genes.
+
+```{r transfer}
+# Make sure order of cells is identical
+stopifnot(all(colnames(sce_all) == colnames(aucell_mimetics$sce)))
+new_cols <- symdiff(colnames(colData(aucell_mimetics$sce)), colnames(colData(sce_all)))
+colData(sce_all)[new_cols] <- colData(aucell_mimetics$sce)[new_cols]
+```
+
+
+```{r save-mimetics}
+saveRDS(aucell_mimetics$sce, file.path(ROOT, params$output_sce_universe))
+saveRDS(aucell_mimetics$tbl, file.path(ROOT, params$output_tbl))
+saveRDS(sce_all, file.path(ROOT, params$output_sce_all))
+```

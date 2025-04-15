@@ -1,0 +1,184 @@
+---
+title: Barcode analysis for select groups of mimetic populations
+date: "`r Sys.Date()`"
+---
+
+# Background
+
+Investigate whether the distribution of barcodes in the two major groups
+supports the hypothesis of separate progenitors for them.
+
+```{r setup, message = FALSE}
+library(tidyverse)
+library(scater)
+library(patchwork)
+devtools::load_all(file.path(ROOT, "R"))
+FIGS <- file.path(ROOT, "analysis", "output", "figures", "sc")
+dir.create(FIGS, recursive = TRUE, showWarnings = FALSE)
+
+# Load integrated data with identified mimetics
+sce <- readRDS(file.path(ROOT, "pipeline", "integrated_universe", "sce_integrated_mimetics.rds"))
+```
+
+
+```{r}
+sce <- sce[, sce$genotype == "WT" & sce$timepoint %in% c("embryo", "newborn", "4week") & sce$barcoded == TRUE]
+metadata <- as.data.frame(colData(sce)) %>%
+    select(sample, genotype, timepoint) %>%
+    distinct()
+rownames(metadata) <- NULL
+```
+
+Metadata of samples still contributing to this analysis:
+
+```{r}
+metadata
+```
+
+
+```{r}
+# Background frequencies of barcodes/scars
+background_bulk <- read.csv(file.path(ROOT, "data", "sc", "background.csv"))
+
+# Group by population or mimetic label
+# Prefer mimetic labels. Do not double count cells.
+bc_counts_all <- as_tibble(colData(sce)) %>%
+    mutate(
+        group = case_when(
+            signature == "Aire-stage" ~ "Aire-stage",
+            signature != "no_signature" ~ "mimetic",
+            label %in% c("early_progenitor", "postnatal_progenitor") ~ label
+        )
+    ) %>%
+    filter(!is.na(group)) %>%
+    group_by(sample, bcid, group) %>%
+    summarize(count = n()) %>%
+    ungroup() %>%
+    mutate(group = forcats::fct_relevel(group, c("early_progenitor", "postnatal_progenitor", "Aire-stage"))) %>%
+    group_by(sample, bcid) %>%
+    mutate(total_bc_count = sum(count)) %>%
+    ungroup() %>%
+    filter(
+        # IMPORTANT!
+        # Filtering of uninformative barcodes
+        !(is.na(bcid)),
+        bcid != "WT"
+    ) %>%
+    complete(nesting(sample, bcid), group, fill = list(count = 0)) %>%
+    group_by(sample, group) %>%
+    mutate(N = sum(count)) # number of cells with barcodes in population
+# Store final used signature labels
+all_groups <- sort(unique(bc_counts_all$group))
+```
+
+
+# Barcode Sampling Probabilities
+
+This shows the p value (probability of sampling this many or more of a barcode
+within a cell population) for all barcodes in all populations. It is analogous
+to the analysis conducted by DG. However, barcodes for all mice were plotted in
+a single heatmap.
+
+Only barcodes with an adjusted p value of ≤ 0.05 in at least one population are
+*shown*, but they do still contribute to p value correction. This reduces
+clutter on the heatmap but is still less strict than what is deemed
+"informative" in Nusser et al. 2022 (Methods, p < 0.001).
+
+P values for individual barcodes carry information about a barcode appearing by
+chance in a population, given its sample size (number of cells with barcodes)
+and the rarity of the respective barcode.
+
+
+```{r fig_4w_barcode_pvals, fig.height = 2, fig.width = 6}
+# p values for individual barcodes in populations, analogous to DG analysis
+bc_p_vals <- bc_counts_all %>%
+    # filter(label != "unassigned" & label != "no_signature") %>%
+    # mutate(label = droplevels(label)) %>%
+    mutate(
+        sfreq = get_background_frequency(bcid, background_bulk),
+        # Make barcode identifiers unique over samples to show all in one heatmap
+        bcid_sample = paste(sample, bcid, sep = ".bc")
+    ) %>%
+    group_by(sample, group, bcid, bcid_sample) %>%
+    summarize(
+        count = count,
+        sfreq = sfreq,
+        N = N,
+        p = binom.test(count, n = max(1, N), p = sfreq, alternative = "g")$p.value,
+        p = ifelse(N > 0, p, NA)
+    ) %>%
+    # Correct p value per sample
+    group_by(sample) %>%
+    mutate(p.adj = barcode_p_adj(p, count)) %>%
+    # Filter completely uninteresting barcodes to reduce clutter
+    group_by(sample, bcid) %>%
+    filter(any(p.adj <= 0.05)) %>%
+    # add metadata
+    left_join(metadata) %>%
+    mutate(log.p.adj = -log10(p.adj + 1e-10))
+
+# Determine plot order by clustering
+bcid_tab <-  with(bc_p_vals, xtabs(log.p.adj ~ bcid_sample + group))
+bcid_ord <- hclust(dist(bcid_tab))$order
+bc_p_vals$bcid_sample <- factor(bc_p_vals$bcid_sample, levels = rownames(bcid_tab)[bcid_ord])
+
+p_crispr_bc <- ggplot(data = NULL, aes(bcid_sample, group, fill = log.p.adj)) +
+    geom_tile() +
+    scale_y_discrete(limits = rev, expand = c(0, 0), labels = LBL_SIGNATURE) +
+    scale_x_discrete(
+        expand = c(0, 0),
+        labels = function(x) {
+            x <- gsub(".+[.]bc", "", x)
+            x <- gsub("_", "/", x)
+            x
+        }
+    ) +
+    scale_fill_viridis_c(breaks = c(0, 5, 10), labels = c(0, 5, "> 10")) +
+    facet_grid(
+        ~sample,
+        scales = "free_x", space = "free",
+        labeller = as_labeller(c(
+            "embryo" = "E16.5",
+            "newborn" = "P0",
+            "W4BCFEM1" = "P28 (#1)",
+            "W4BCFEM2" = "P28 (#2)",
+            "W4BCMALE" = "P28 (#3)"
+        ))
+    ) +
+    labs(
+        x = "CRISPR barcode",
+        y = NULL,
+        fill = quote(-log[10]*"(adj. p)")
+    ) +
+    guides(fill = guide_colorbar(title.position = "top")) +
+    theme(
+        legend.direction = "horizontal",
+        legend.key.width = unit(5, "mm"),
+        legend.key.height = unit(2, "mm"),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, margin = unit(c(1, 1, 1, 1), "pt"))
+    ) +
+    geom_hline(yintercept = seq(0.5, 10.5, by = 1), color = "gray90", linewidth = 0.1)
+row1 <- c("embryo", "newborn")
+p_crispr_bc1 <- (p_crispr_bc %+% filter(bc_p_vals, sample %in% row1)) +
+    theme(
+        axis.title.x = element_blank(),
+        legend.box.margin = unit(c(0, 0, 0, 10), "mm")
+    )
+p_crispr_bc2 <- (p_crispr_bc %+% filter(bc_p_vals, !(sample %in% row1))) +
+    theme(legend.position = "none")
+p_crispr_bc <- (
+    (
+        (p_crispr_bc1 + guide_area()) + plot_layout(widths = c(3, 1))
+    ) /
+        (p_crispr_bc2)
+    )
+p_crispr_bc
+
+write.table(
+    bc_p_vals[c("sample", "timepoint", "group", "bcid", "log.p.adj")],
+    file.path(FIGS, "tbl_barcode_pvals.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+fig_pdf(FIGS, p_crispr_bc)
+```

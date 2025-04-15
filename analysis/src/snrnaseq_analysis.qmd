@@ -1,0 +1,492 @@
+---
+title: snRNAseq
+subtitle: Cluster Annotation/Analysis
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    lightbox: true
+    fig-width: 12
+---
+
+
+```{r packages, message = FALSE, warning = FALSE, results = "hide", cache = FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(ComplexHeatmap)
+library(scran)
+library(scuttle)
+library(scater)
+library(bluster)
+devtools::load_all(file.path(ROOT, "R"))  # basically library(mimetics)
+FIGS <- file.path(ROOT, "analysis", "output", "figures", "snrnaseq")
+dir.create(FIGS, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r warning = FALSE}
+sce <- readRDS(file.path(ROOT, "pipeline/snrnaseq_clustering.rds"))
+# Find upregulated markers for clusters to inspect if signatures are inconclusive
+# cl_markers <- findMarkers(sce, groups = sce$cluster, direction = "up", block = sce$sample)
+```
+
+
+# Overview
+
+```{r}
+TOP_TEC_MAX <- 5
+```
+
+Cells were scored for TEC and background signatures using `AUCell`. The
+following plot shows the highest-scoring TEC-related signature for each cell,
+but **only** if this signature is within the top `r TOP_TEC_MAX` signatures for
+that cell. For example, if the highest scoring TEC signature in a cell is
+"mTEC", but mTEC is only the `r TOP_TEC_MAX * 10`-highest scoring signature, it
+would not be highlighted.
+
+```{r sigs-overview}
+p_sigs_overview <- ggcells(sce, aes(UMAP.1, UMAP.2, color = top_tec)) +
+    geom_point(color = "gray") +
+    geom_point(data = ~filter(., top_tec_rank <= TOP_TEC_MAX))
+p_sigs_overview
+p_sigs_overview + facet_wrap(~condition)
+```
+
+
+There are some clearly discernible clusters. For example, Ciliated and Tuft
+cells are strongly delineated from other populations.
+
+Especially in the nude samples, there are swathes of cells which are not
+dominated by a single signature, but an ill-defined mixture. This may be
+indicative of failed differentiation of these cells due to the absence of
+*Foxn1*.
+
+
+# Cluster Identities
+
+Investigate highest-scoring signatures for each cluster.
+
+Rank signature by their median expression per subcluster, and show all that are in
+the top 20 in any subcluster.
+
+```{r}
+#' Plot AUCs of the highest scoring signatures in each group.
+top_sigs_hm <- function(sce, groups, n_top = 20) {
+    aucs <- colData(sce) %>%
+        as_tibble() %>%
+        pivot_longer(starts_with("auc_"), names_to = "signature", values_to = "auc") %>%
+        group_by(.data[[groups]], signature) %>%
+        summarize(median_auc = median(auc)) %>%
+        mutate(rank_auc = rank(-median_auc)) %>%
+        group_by(signature) %>%
+        filter(any(rank_auc <= n_top)) %>%
+        ungroup() %>%
+        pivot_wider(names_from = signature, values_from = median_auc, id_cols = .data[[groups]]) %>%
+        tibble::column_to_rownames(groups) %>%
+        as.matrix() %>%
+        t()
+    Heatmap(aucs,
+        col = mimetics:::viridis_scale(0, max(aucs)),
+        cluster_columns = FALSE,
+        row_names_gp = gpar(fontsize = 6),
+        # column_names_gp = gpar(fontsize = 6),
+        row_labels = gsub("^auc_", "", rownames(aucs)),
+        row_names_max_width = max_text_width(rownames(aucs)),
+        row_dend_width = unit(0.3, "cm"),
+        name = "Median AUC",
+        heatmap_legend_param = list(grid_width = unit(3, "mm"), direction = "horizontal")
+    )
+}
+p_umap <- ggcells(sce, aes(UMAP.1, UMAP.2)) +
+    geom_point(color = "gray") +
+    mimetics:::theme_umap
+sigs_and_umap <- function(sce, subset, group) {
+    df <- makePerCellDF(sce, use.dimred = "UMAP")[subset, ]
+    gridExtra::grid.arrange(
+        grid::grid.grabExpr(draw(
+            top_sigs_hm(sce[, subset], group),
+            heatmap_legend_side = "bottom",
+        )),
+        p_umap + geom_point(data = df, aes(color = .data[[group]])),
+        ncol = 2
+    )
+}
+```
+
+
+
+## Cluster 1
+
+* Muscle and Aire-stage high.
+* No Aire/Foxn1 expression
+* coincides with high proportion of Ribosomal protein gene counts
+* likely contamination/low quality cluster
+
+```{r cluster1}
+sigs_and_umap(sce, sce$c1 == "01", "c2")
+is_ribosomal <- grepl("^(Rpl|Rps)", rownames(sce))
+sce$prc_ribosomal <- sumCountsAcrossFeatures(sce, list(ribosomal = is_ribosomal)) / sce$sum
+ggcells(sce, aes(UMAP.1, UMAP.2, color = prc_ribosomal)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Aire)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Foxn1)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Epcam)) + geom_point()
+sce$label[sce$c1 == "01"] <- "low quality 1"
+```
+
+
+## Cluster 2
+
+* 02.1 scores high for endothelial markers
+* 02.3 scores relatively highly for adipocyte markers
+* poorly defined connective tissue cluster
+
+```{r cluster2}
+sigs_and_umap(sce, sce$c1 == "02", "c2")
+sce$label[sce$c1 == "02"] <- "connective tissue"
+```
+
+
+## Cluster 3
+
+DCs/Macrophages
+
+```{r cluster3}
+sigs_and_umap(sce, sce$c1 == "03", "c2")
+sce$label[sce$c1 == "03"] <- "haematopoietic 1"
+```
+
+## Cluster 4
+
+* 04.1: cTECs
+* 04.2: T cell signature, contaminated cTECs, nurse cells?
+* 04.3: Tuft cells, express *Pou2f3*
+
+```{r cluster4}
+sigs_and_umap(sce, sce$c1 == "04", "c2")
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Pou2f3)) + geom_point()
+
+sce$label[sce$cluster == "04.1"] <- "cTEC"
+sce$label[sce$cluster == "04.2"] <- "low quality 2"
+sce$label[sce$cluster == "04.3"] <- "tuft"
+```
+
+
+
+## Cluster 5
+
+B cells and potentially pDCs
+
+```{r cluster5}
+sigs_and_umap(sce, sce$c1 == "05", "c2")
+sce$label[sce$cluster == "05.1"] <- "haematopoietic 2"
+sce$label[sce$cluster == "05.2"] <- "haematopoietic 2"
+```
+
+
+## Cluster 6
+
+Fibroblasts and contaminated Fibroblasts.
+
+* 06.1 is from het, 06.2 and 06.3 are from nude. These clusters are separate
+  despite data integration.
+* Some cells show expression of Tox/Themis, indicative of persistent background
+  contamination with thymocyte genes.
+
+```{r cluster6}
+sigs_and_umap(sce, sce$c1 == "06", "c2")
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Tox)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Themis)) + geom_point()
+sce$label[sce$c1 == "06"] <- "fibroblasts"
+```
+
+
+## Cluster 7
+
+Note that signature scores are rather low.
+
+* 07.1: postnatal progenitor
+* 07.2: mTEC, with other signatures (Microfold, Neuroendocrine)
+* 07.4 several muscle-related  and neuronal signatures
+
+07.1 and 07.2 show some Aire/Foxn1 expression.
+
+Parts of 07.4 express Titin and Dystrophin (*Dmd*). The cluster is visually
+split even after subclustering.
+
+```{r, cluster7}
+sigs_and_umap(sce, sce$c1 == "07", "c2")
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Aire)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Foxn1)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Ttn)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Dmd)) + geom_point()
+
+sce$label[sce$c1 == "07"] <- "poorly differentiated"
+sce$label[sce$cluster == "07.1"] <- "postnatal prog."
+sce$label[sce$cluster == "07.2"] <- "mTEC"
+```
+
+
+## Cluster 8
+
+Ciliated
+
+```{r cluster8}
+sigs_and_umap(sce, sce$c1 == "08", "c2")
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Foxj1)) + geom_point()
+sce$label[sce$cluster == "08"] <- "ciliated"
+```
+
+
+## Cluster 9
+
+poorly differentiated cell mass. AUCs overall are very low.
+
+```{r cluster9}
+sigs_and_umap(sce, sce$c1 == "09", "c2")
+sce$label[sce$c1 == "09"] <- "poorly differentiated"
+```
+
+
+## Cluster 10
+
+early progenitor-like
+
+```{r cluster10}
+sigs_and_umap(sce, sce$c1 == "10", "c2")
+sce$label[sce$c1 == "10"] <- "poorly differentiated"
+```
+
+
+## Cluster 11
+
+Ionocytes. In contrast to cells with a Ionocyte signature in the poorly
+differentiated nude cell mass, Ionocyte scores are much higher in this cluster.
+There is also expression of *Foxi1*, *Foxi2*, and *Epcam*.
+
+```{r cluster11}
+sigs_and_umap(sce, sce$c1 == "11", "c2")
+ggcells(sce, aes(UMAP.1, UMAP.2, color = auc_Ionocyte)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Foxi1)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Foxi2)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Epcam)) + geom_point()
+ggcells(sce, aes(cluster, auc_Ionocyte)) + ggbeeswarm::geom_quasirandom()
+sce$label[sce$cluster == "11"] <- "ionocyte"
+```
+
+## Cluster 12
+
+stem cells, Tg/Pax8 expressing - ectopic thyroid tissue? Not all samples show
+this cluster, in agreement with the sporadic occurrence of an ectopic thyroid
+(Nu\_2, Nu\_3).
+
+```{r cluster12}
+sigs_and_umap(sce, sce$c1 == "12", "c2")
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Tg)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = Pax8)) + geom_point() +
+ggcells(sce, aes(UMAP.1, UMAP.2, color = sample)) + geom_point()
+sce$label[sce$cluster == "12"] <- "ectopic thyroid"
+```
+
+
+# Summary of Labels
+
+```{r}
+ggcells(sce, aes(UMAP.1, UMAP.2, color = label)) + geom_point()
+```
+
+We arrive at the following picture of clusters with TEC/mimetic-relevant
+labels:
+
+```{r, fig_sn_labels, fig.width = 4, fig.height = 3.9}
+colData(sce)$label_str <- gsub("\\s+\\d+", "", colData(sce)$label) # remove suffix numbers
+pop_labels <- makePerCellDF(sce) %>%
+    group_by(label, label_str) %>%
+    summarize(across(starts_with("UMAP"), median))
+dat_labels <- makePerCellDF(sce, use.dimred = "UMAP", features = c("Foxj1", "Pou2f3", "Foxi1")) %>%
+    arrange(condition)  # order to plot Foxn1het on top
+lbls <- unique(dat_labels$label_str)
+important <- c("ciliated", "mTEC", "cTEC", "tuft", "ionocyte", "postnatal prog.")
+lbls_important <- lbls[lbls %in% important]
+lbls_unimportant <- lbls[!lbls %in% important]
+set.seed(1099)  # reproducible color choice
+pal <- c(
+    sample(RColorBrewer::brewer.pal(n = length(lbls_important), "Set2")),
+    sample(gray(seq(0.6, 0.9, length.out = length(lbls_unimportant))))
+)
+names(pal) <- c(lbls_important, lbls_unimportant)
+p <- ggplot(dat_labels, aes(UMAP.1, UMAP.2, color = label_str)) +
+    geom_point(aes(shape = condition)) +
+    geom_label(
+        data = pop_labels,
+        label.size = 0,
+        alpha = 0.5,
+        show.legend = FALSE,
+        color = "black",
+        aes(
+            label = label_str,
+            shape = NULL
+            # color = stage(label, after_scale = colorspace::darken(color, 0.8)),
+            # fill = stage(label, after_scale = colorspace::lighten(color, 0.8))
+        )
+    ) +
+    scale_color_manual(values = pal, guide = "none") +
+    scale_shape_manual(values = c(19, 19), guide = "none") +
+    coord_fixed() +
+    mimetics:::theme_umap +
+    labs(x = "UMAP1", y = "UMAP2") +
+    theme(
+        axis.title = element_text(),
+        legend.position = "inside",
+        legend.position.inside = c(0, 0),
+        legend.justification.inside = c(-0.1, -0.1),
+    )
+p
+
+fig_pdf(FIGS, p)
+```
+
+```{r fig_sn_aucs, fig.width = 4.5, fig.height = 2}
+p_auc <- ggcells(sce, aes(UMAP.1, UMAP.2)) +
+    geom_point(size = 0.1) +
+    scale_color_viridis_c(name = "AUC", limits = c(0, 0.4)) +
+    mimetics:::theme_umap +
+    labs(x = "UMAP1", y = "UMAP2") +
+    theme(axis.title = element_text()) +
+    coord_fixed()
+p_auc_cil <- p_auc + aes(color = auc_Ciliated) + labs(title = "Ciliated")
+p_auc_tuft <- p_auc + aes(color = auc_Tuft) + labs(title = "Tuft")
+p_auc_iono <- p_auc + aes(color = auc_Ionocyte) + labs(title = "Ionocyte")
+p_auc_mim <- p_auc_cil +
+    p_auc_tuft + theme(axis.title.y = element_blank()) +
+    p_auc_iono + theme(axis.title.y = element_blank()) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+p_auc_mim
+fig_pdf(FIGS, p_auc_mim)
+```
+
+```{r detail-prep}
+# Preparations for detail plots
+
+# Deep copy to allow adjustment of individual layers without affecting other
+# plots
+deepcopy <- function(p) {
+    unserialize(serialize(p, NULL))
+}
+
+# Reusable scale for showing Foxn1 status by color
+lbl_foxn1 <- c("Foxn1het" = "Foxn1+/-", "Foxn1KO" = "Foxn1-/-")
+scale_color_foxn1 <- scale_color_discrete(labels = lbl_foxn1)
+scale_fill_foxn1 <- scale_fill_discrete(labels = lbl_foxn1)
+```
+
+## Zoom: Ciliated / Tuft
+
+```{r fig_sn_ciltuft, fig.width = 5, fig.height = 2}
+p_ct <- deepcopy(p)
+p_ct <- p_ct + aes(color = condition)
+p_ct$layers[[2]]$aes_params$hjust <- 1
+p_ct$layers[[2]]$position <- position_nudge(x = -0.3, y = 0.3)
+p_ct <- p_ct +
+    coord_fixed(ylim = c(-11.5, -8.5), xlim = c(4.5, 7)) +
+    scale_color_foxn1 +
+    labs(color = NULL)
+
+p_ct_genes <- p_ct + scale_shape_manual(values = c(19, 19), guide = "none")
+p_foxj1 <- p_ct_genes + aes(color = Foxj1) + scale_color_viridis_c()
+p_pou2f3 <- p_ct_genes + aes(color = Pou2f3) + scale_color_viridis_c()
+p_ct_all <- p_ct +
+    p_foxj1 + theme(axis.title.y = element_blank()) +
+    p_pou2f3 + theme(axis.title.y = element_blank())
+p_ct_all
+fig_pdf(FIGS, p_ct_all)
+```
+
+
+## Zoom: Ionocytes
+
+```{r fig_sn_iono, fig.width = 3.8, fig.height = 2}
+p_i <- deepcopy(p) +
+    aes(color = condition) +
+    coord_fixed(ylim = c(5, 9), xlim = c(-2, 2)) +
+    theme(legend.position.inside = c(0.48, 0)) +
+    scale_color_foxn1 +
+    labs(color = NULL)
+p_i$layers[[2]]$aes_params$hjust <- 1
+p_i$layers[[2]]$position <- position_nudge(-0.5)
+p_foxi1 <- p_i + aes(color = Foxi1) + scale_color_viridis_c() + scale_shape_manual(values = c(19, 19), guide = "none")
+p_i_all <- p_i +
+    p_foxi1 + theme(axis.title.y = element_blank())
+p_i_all
+fig_pdf(FIGS, p_i_all)
+```
+
+# Distribution Between Conditions
+
+The plot shows the proportion of cells in each labelled cluster by condition.
+Individual replicates are shaded.
+
+```{r fig_sn_props1, fig.width = 2.5, fig.height = 2}
+dat_clusts <- colData(sce) %>%
+    as_tibble() %>%
+    select(sample, condition, label) %>%
+    filter(!is.na(label))
+dat_clusts_agg <- dat_clusts %>%
+    extract(sample, into = "rep", regex = "_(\\d+)$") %>%
+    group_by(condition, rep, label) %>%
+    summarize(count = n()) %>%
+    group_by(label) %>%
+    mutate(prop = count / sum(count))
+p_props <- ggplot(dat_clusts_agg, aes(label, prop, fill = condition, alpha = factor(rep))) +
+    geom_col(fill = "white",  alpha = 1, width = 0.3) +  # white background for transparent bars
+    geom_col(position = "fill",  width = 0.3) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    scale_alpha_discrete(range = c(0.3, 1)) +  # shade replicates
+    labs(x = NULL, y = "Proportion") +
+    scale_fill_foxn1 +
+    labs(alpha = "Replicates", fill = "Genotype") +
+    guides(
+        alpha = guide_legend(
+            override.aes = list(linewidth = 0),
+            theme = theme(
+                # legend.background = element_rect(color = "red", linewidth = 2, fill = "red"),
+                legend.title.position = "top",
+                legend.direction = "horizontal",
+                legend.key.width = unit(8, "pt"),
+                legend.key = element_blank(),
+                legend.key.spacing.x = unit(0, "mm"),
+                legend.text = element_blank()
+            )
+        )
+    )
+
+p_props1 <- p_props +
+    scale_x_discrete(limits = c("mTEC", "cTEC", "tuft", "ciliated"))
+p_props1
+fig_pdf(FIGS, p_props1)
+```
+
+```{r fig_sn_props2, fig.width = 1.5, fig.height = 2}
+p_props2 <- p_props +
+    scale_x_discrete(limits = c("ionocyte")) +
+    theme(legend.position = "right")
+p_props2
+fig_pdf(FIGS, p_props2)
+```
+
+
+```{r tbl}
+# Save data tables
+tbl_genes <- c("Foxi1", "Foxj1", "Pou2f3")
+tbl_aucs <- c("Ciliated", "Tuft", "Ionocyte")
+data_tbl <- makePerCellDF(sce, use.dimred = "UMAP", features = tbl_genes)
+data_tbl <- data_tbl[, c("sample", "condition", "UMAP.1", "UMAP.2", "label", tbl_genes, paste0("auc_", tbl_aucs))]
+data_tbl <- as_tibble(data_tbl, rownames = "cell")
+write.table(data_tbl, file.path(FIGS, "tbl_umap.tsv"), sep = "\t", row.names = FALSE)
+
+props_tbl <- dat_clusts_agg %>% filter(label %in% c("mTEC", "cTEC", "tuft", "ciliated", "ionocyte"))
+write.table(props_tbl, file.path(FIGS, "tbl_props.tsv"), sep = "\t", row.names = FALSE)
+```

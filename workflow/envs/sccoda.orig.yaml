@@ -1,0 +1,9 @@
+name: sccoda
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python==3.12.4
+  - pip:
+    - pertpy==0.7.0
+    - jax==0.4.30

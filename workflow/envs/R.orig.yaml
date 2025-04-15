@@ -1,0 +1,24 @@
+name: R
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base==4.2.3
+  - r-here==1.0.1
+  - r-tidyverse==1.3.2
+  - r-ggplot2==3.5.1
+  - r-remotes==2.4.2
+  - r-devtools==2.4.5
+  - r-matrix==1.6_1
+  - r-matrixstats==1.0.0
+  - r-patchwork==1.2.0
+  - r-geomtextpath==0.1.4
+  - r-dbplyr<=2.3.4
+  - r-desctools==0.99.51
+  - r-writexl==1.5.0
+  - bioconductor-biomart==2.54.0
+  - bioconductor-aucell==1.20.1
+  - bioconductor-scran==1.26.0
+  - bioconductor-scater==1.26.0
+  - bioconductor-batchelor==1.14.0
+  - bioconductor-complexheatmap==2.14.0

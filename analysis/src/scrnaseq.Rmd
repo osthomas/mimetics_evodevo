@@ -1,0 +1,498 @@
+---
+title: Analysis of scRNAseq of 4 week old mice
+date: "`r Sys.Date()`"
+---
+
+
+```{r setup, message = FALSE}
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(scran)
+library(scater)
+devtools::load_all(file.path(ROOT, "R"))
+FIGS <- file.path(ROOT, "analysis", "output", "figures", "sc")
+dir.create(FIGS, recursive = TRUE, showWarnings = FALSE)
+sce <- readRDS(file.path(ROOT, "pipeline", "integrated_universe", "sce_integrated_mimetics.rds"))
+# Reorder factor for plotting
+sce$signature <- forcats::fct_relevel(sce$signature, names(LBL_SIGNATURE))
+sce_young <- sce[, sce$sample %in% c("embryo", "newborn", "W4BCFEM1", "W4BCFEM2", "W4BCMALE", "W4WTMALE")]
+colData(sce_young) <- droplevels(colData(sce_young))
+sce_4w <- sce[, sce$sample %in% c("W4BCFEM1", "W4BCFEM2", "W4BCMALE", "W4WTMALE")]
+colData(sce_4w) <- droplevels(colData(sce_4w))
+sce_4w_bc <- sce_4w[, sce_4w$barcoded]
+```
+
+
+# UMAP: Mimetics
+
+Integrated UMAP of 4 week old wild type mice, barcoded and unbarcoded, showing
+identified mimetic cells (this study) overlaid on population labels (Nusser
+2022).
+
+For visualization of 4 week old mice, the integrated UMAP also shown in Nusser
+2022 is used.
+
+The cell counts indicate the number of cells with the respective signature
+summed across all included mice, whether barcoded or not.
+
+The following mice are included:
+
+`r unique(colData(sce_4w)$sample)`
+
+```{r fig_umap, fig.height = 6.6, fig.width = 2.2}
+dat_umap <- makePerCellDF(sce_young)
+dat_umap$signature <- droplevels(dat_umap$signature)
+# Background with all cells, irrespective of signatures
+dat_umap_bg <- makePerCellDF(sce_young)
+dat_umap_bg$signature <- NULL
+dat_umap_cts <- dat_umap %>% group_by(signature) %>% tally()
+
+plt_mimetics_umap <- function(sce, text_x = Inf, text_y = Inf) {
+    dat_umap <- makePerCellDF(sce)
+    # ensure square plots
+    to_rng <- c(0, 1)
+    dat_umap$UMAP.1 <- scales::rescale(dat_umap$UMAP.1, to = to_rng)
+    dat_umap$UMAP.2 <- scales::rescale(dat_umap$UMAP.2, to = to_rng)
+    # Background: all cells
+    dat_bg <- mutate(dat_umap, signature = NULL)
+    dat_umap <- filter(dat_umap, signature != "no_signature")
+    dat_umap$signature <- factor(dat_umap$signature, levels = levels(dat_umap$signature), exclude = "no_signature")
+    dat_count <- dat_umap %>% group_by(signature, .drop = FALSE) %>% tally()
+    p_umap <- ggplot(data = dat_umap, aes(UMAP.1, UMAP.2, color = label)) +
+        geom_point(data = dat_bg, size = 0.1, show.legend = TRUE) +
+        geom_point(color = "black", show.legend = FALSE) +
+        geom_text(
+            data = dat_count,
+            inherit.aes = FALSE,
+            aes(x = text_x, y = text_y, label = sprintf("n=%d", n)),
+            hjust = 1.1, vjust = 1.5
+        ) +
+        facet_wrap(~signature, drop = FALSE, labeller = as_labeller(LBL_SIGNATURE)) +
+        scale_color_manual(
+            name = NULL,
+            limits = names(COL_POPULATION),
+            values = COL_POPULATION,
+            labels = as_labeller(LBL_SIGNATURE),
+            drop = FALSE
+        ) +
+        labs(
+            x = "UMAP1",
+            y = "UMAP2"
+        ) +
+        coord_fixed(xlim = to_rng, ylim = to_rng) +
+        theme_umap +
+        theme(
+            plot.title = element_text(size = rel(0.9)),
+            strip.text = element_text(size = rel(0.7)),
+            legend.position = "bottom",
+            panel.border = element_blank(),
+            plot.margin = margin(0, 0, 5, 0, "pt"),
+            panel.spacing.x = unit(1, "pt"),
+            panel.spacing.y = unit(1, "pt"),
+        ) +
+        guides(color = guide_legend(override.aes = list(size = 2), nrow = 3))
+}
+
+sce_e16 <- sce_young[, sce_young$timepoint == "embryo"]
+p_umap_e16 <- plt_mimetics_umap(sce_e16, text_y = 0.3) +
+    labs(title = sprintf(
+        "E16.5 (%d mouse, %d cells)",
+        length(unique(sce_e16$sample)),
+        ncol(sce_e16)
+    ))
+sce_p0 <- sce_young[, sce_young$timepoint == "newborn"]
+p_umap_p0 <- plt_mimetics_umap(sce_p0, text_y = 0.65) +
+    labs(title = sprintf(
+        "P0 (%d mouse, %d cells)",
+        length(unique(sce_p0$sample)),
+        ncol(sce_p0)
+    ))
+sce_4w <- sce_young[, sce_young$timepoint == "4week"]
+p_umap_4w <- plt_mimetics_umap(sce_4w, text_y = 0.8) +
+    labs(title = sprintf(
+        "P28 (%d mice, %d cells)",
+        length(unique(sce_4w$sample)),
+        ncol(sce_4w)
+    ))
+p_umap <- (
+    (p_umap_e16 / p_umap_p0 / p_umap_4w) /
+    guide_area()
+) + plot_layout(
+        guides = "collect",
+        heights = unit(c(1, 1, 1, 0.8), c("null", "null", "null", "cm"))
+    )
+
+write.table(
+    dat_umap[c("sample", "transcriptome", "genotype", "timepoint", "label", "signature", "UMAP.1", "UMAP.2")],
+    file.path(FIGS, "tbl_umap.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+p_umap
+fig_pdf(FIGS, p_umap)
+```
+
+
+# Counts and Proportions of Populations
+
+```{r pop_props}
+dat_pops <- dat_umap %>%
+    mutate(
+        Population = case_when(
+            signature != "no_signature" ~ signature,
+            signature == "no_signature" ~ label
+        ),
+        Population = forcats::fct_drop(Population, "no_signature"),
+        Population = forcats::fct_relevel(Population, names(LBL_SIGNATURE)),
+        Population = forcats::fct_relabel(Population, function(x) LBL_SIGNATURE[x])
+    )
+
+
+dat_pops_all <- dat_pops %>%
+    group_by(timepoint, Population) %>%
+    summarize(count = n()) %>%
+    mutate(prop = count / sum(count)) %>%
+    ungroup() %>%
+    complete(timepoint, Population, fill = list(count = 0, prop = 0)) %>%
+    arrange(timepoint, Population) %>%
+    mutate(count_prop = sprintf("%d (%.1f%%)", count, prop * 100)) %>%
+    pivot_wider(id_cols = Population, names_from = timepoint, values_from = count_prop) %>%
+    arrange(Population) %>%
+    rename(embryo = "E16.5", newborn = "P0", `4week` = "P28")
+writexl::write_xlsx(dat_pops_all, file.path(FIGS, "tbl_counts_all.xlsx"))
+```
+
+# UMAP: Gene Expression
+
+```{r supp_umap_genes, fig.width = 5.5, fig.height = 2.3}
+dat_umap_genes <- makePerCellDF(sce_4w, features = c("Ascl1", "Fgfr2"))
+dat_umap_genes_long <- dat_umap_genes %>%
+    pivot_longer(c("Ascl1", "Fgfr2"), names_to = "gene", values_to = "logcounts")
+
+p_umap_labels <- ggcells(sce_4w, aes(UMAP.1, UMAP.2, color = label)) +
+    geom_point() +
+    theme_umap +
+    coord_fixed() +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(override.aes = list(size = 2), nrow = 3)) +
+    scale_color_manual(
+        name = NULL,
+        limits = names(COL_POPULATION),
+        values = COL_POPULATION,
+        labels = as_labeller(gsub("Progenitor", "Prog.", LBL_SIGNATURE))
+    )
+
+p_umap_genes_list <- lapply(c("Ascl1", "Fgfr2"), function(gene) {
+    d_gene <- makePerCellDF(sce_4w, features = gene)
+    ggplot(d_gene, aes(UMAP.1, UMAP.2, color = .data[[gene]])) +
+        geom_point() +
+        theme_umap +
+        coord_fixed() +
+        labs(title = gene) +
+        scale_color_viridis_c(name = quote(log[2]*"(CP10k)"))
+})
+p_umap_genes <- p_umap_labels + p_umap_genes_list
+p_umap_genes
+
+write.table(
+    dat_umap_genes[c("sample", "transcriptome", "genotype", "timepoint", "label", "Ascl1", "Fgfr2", "UMAP.1", "UMAP.2")],
+    file.path(FIGS, "tbl_umap_genes.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+fig_pdf(FIGS, p_umap_genes)
+```
+
+
+# Gene expression
+
+```{r}
+plot_expr <- function(sce, gene, res_test, pval_y = Inf) {
+    dat <- makePerCellDF(sce, features = gene)
+    lab_y <- bquote(.(gene) * " (" * log[2] * "(CP10k))")
+    text_y <- max(dat[[gene]], na.rm = TRUE) * 1.2
+    p <- ggplot(data = dat, aes(y = .data[[gene]])) +
+        ggbeeswarm::geom_quasirandom(size = 0.3) +
+        geom_text(stat = "summary", vjust = 1, fun.data = function(gene) {
+            over0 <- sum(gene > 0)
+            total <- length(gene)
+            prc <- (over0 / total) * 100
+            label <- sprintf("%d cells\n%.0f%% > 0", total, prc)
+            data.frame(y = text_y, label = label)
+        }) +
+        labs(y = lab_y) +
+        theme(legend.position = "none", axis.title.x = element_blank())
+    if (!missing(res_test)) {
+        # add p value if test results are provided
+        p <- p + annotate(
+            geom = "text",
+            x = 1.5, y = pval_y,
+            parse = TRUE,
+            label = pval_fmt(res_test[gene, "FDR"])
+        )
+    }
+    p
+}
+```
+
+
+## TEC populations
+
+### Foxn1
+
+Foxn1 expression in TEC populations.
+
+```{r fig_4w_foxn1_populations, fig.width = 2.5, fig.height = 2}
+sce_4w_nonurse <- sce_4w[, sce_4w$label != "cTEC_nurse"]
+p_foxn1_pop <- plot_expr(sce_4w_nonurse, "Foxn1") +
+    aes(x = label, color = label) +
+    scale_color_manual(values = COL_POPULATION, labels = LBL_SIGNATURE) +
+    scale_x_discrete(labels = gsub(" Progenitor", "\nProg.", LBL_SIGNATURE))
+p_foxn1_pop
+
+write.table(
+    p_foxn1_pop$data[c("sample", "transcriptome", "genotype", "timepoint", "label", "Foxn1")],
+    file.path(FIGS, "tbl_foxn1_pop.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+fig_pdf(FIGS, p_foxn1_pop)
+```
+
+
+## Mimetics
+
+### Foxn1
+
+Foxn1 expression in mimetic populations.
+
+```{r fig_4w_foxn1_mimetics, fig.width = 4.5, fig.height = 2}
+sce_4w_mim <- sce_4w_nonurse[, sce_4w_nonurse$signature != "no_signature"]
+p_foxn1_mim <- plot_expr(sce_4w_mim, "Foxn1") +
+    aes(x = signature) +
+    scale_x_discrete(labels = LBL_SIGNATURE) +
+    theme(axis.text.x = element_text(angle = 15, hjust = 1, vjust = 1))
+p_foxn1_mim
+
+write.table(
+    p_foxn1_mim$data[c("sample", "transcriptome", "genotype", "timepoint", "signature", "Foxn1")],
+    file.path(FIGS, "tbl_foxn1_mim.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+fig_pdf(FIGS, p_foxn1_mim)
+```
+
+
+## Aire-stage vs. mimetics
+
+### Foxn1
+
+Foxn1 expression in Aire-stage vs. mimetics.
+
+```{r fig_4w_foxn1_overall, fig.height = 2.5, fig.width = 1.5}
+sce_4w_mim$as_or_mim <- ifelse(sce_4w_mim$signature == "Aire-stage", "Aire-stage", "mimetic")
+res_binom_agg <- findMarkers(
+    sce_4w_mim,
+    groups = sce_4w_mim$as_or_mim,
+    block = sce_4w_mim$sample,
+    test.type = "binom")
+# Make sure results are symmetric
+stopifnot(all(res_binom_agg[["Aire-stage"]] == res_binom_agg[["mimetic"]]))
+res_binom_agg <- res_binom_agg[["mimetic"]]
+p_foxn1_agg <- plot_expr(sce_4w_mim, "Foxn1", res_binom_agg, pval_y = 4) +
+    aes(x = as_or_mim)
+p_foxn1_agg
+fig_pdf(FIGS, p_foxn1_agg)
+```
+
+### Aire/Fezf2
+
+```{r supp_4w_fezf2aire_overall, fig.height = 3.5, fig.width = 1.3}
+p_fezf2_aire <- lapply(c("Aire", "Fezf2"), function(gene) {
+    plot_expr(sce_4w_mim, gene, res_binom_agg, pval_y = 6) + aes(x = as_or_mim)
+})
+p_fezf2_aire[[1]] <- p_fezf2_aire[[1]] + theme(plot.margin = margin(1, 1, 15, 1, "pt"))
+p_fezf2_aire <- wrap_plots(p_fezf2_aire, ncol = 1)
+p_fezf2_aire
+fig_pdf(FIGS, p_fezf2_aire)
+```
+
+```{r genes-table}
+mim_genes_genes <- c("Foxn1", "Aire", "Fezf2")
+mim_genes_tbl <- makePerCellDF(sce_4w_mim, features = mim_genes_genes)
+write.table(
+    mim_genes_tbl[c("sample", "transcriptome", "genotype", "timepoint", "as_or_mim", mim_genes_genes)],
+    file.path(FIGS, "tbl_genes_agg.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+```
+
+
+# Proportion of barcoded cells
+
+Proportion of barcoded cells per sample for each signature.
+
+Error bars show 95% confidence intervals of overall proportions.
+
+```{r fig_4w_barcoded, fig.height = 2, fig.width = 3.8}
+dat_barcoded <- as.data.frame(colData(sce_4w_bc)) %>%
+    mutate(
+        has_bc = !is.na(bcid) & bcid != "WT",
+        signature = ifelse(
+            signature == "no_signature",
+            as.character(label),
+            as.character(signature)
+        ),
+        signature = factor(signature, levels = names(LBL_SIGNATURE))
+    )
+dat_barcoded_agg <- dat_barcoded %>%
+    group_by(signature) %>%
+    # proportions with confidence intervals
+    summarize(has_bc = sum(has_bc), n = n()) %>%
+    mutate(.tmp = data.frame(DescTools::BinomCI(has_bc, n, method = "modified wilson"))) %>%
+    unnest_wider(.tmp)
+
+# Fit glm, correction for sample
+barcoded_full_mdl <- glm(has_bc ~ signature + sample, data = dat_barcoded, family = "binomial")
+barcoded_drop <- drop1(barcoded_full_mdl, test = "LRT")
+
+p_barcoded <- ggplot(dat_barcoded_agg, aes(signature, est)) +
+    geom_errorbar(aes(ymin = lwr.ci, ymax = upr.ci), width = 0.2) +
+    geom_col(color = "black", fill = "gray90") +
+    geom_text(
+        aes(label = paste0("n=", n)),
+        color = "black",
+        y = 0.01,
+        nudge_x = 0.2,
+        angle = 90,
+        hjust = 0
+    ) +
+    annotate(
+        "segment",
+        x = 0.5, xend = length(unique(dat_barcoded_agg$signature)) + 0.5,
+        y = 0.85, yend = 0.85
+    ) +
+    annotate(
+        "text",
+        x = (1 + length(unique(dat_barcoded_agg$signature))) / 2, y = 0.85, vjust = -0.5,
+        label = sprintf("p = %.2f", barcoded_drop["signature", "Pr(>Chi)"])
+    ) +
+    scale_x_discrete(labels = gsub("Progenitor", "Prog.", LBL_SIGNATURE)) +
+    scale_y_continuous(labels = function(x) x * 100, expand = expansion(0, c(0, 0.03)), limits = c(0, 1)) +
+    theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)
+    ) +
+    labs(
+        y = "Cells with barcodes (%)",
+        x = NULL
+    )
+p_barcoded
+
+write.table(
+    dat_barcoded_agg,
+    file.path(FIGS, "tbl_barcoded.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+fig_pdf(FIGS, p_barcoded)
+```
+
+Test: Fit a general linear model and drop terms, perform likelihood ratio test
+to determine if term is significant.
+
+Null Hypothesis: Affiliation of cell with a signature does *not* change its
+overall probability of being barcoded.
+
+```{r}
+barcoded_drop
+```
+
+Result: `signature` is not a significant term overall. We can not reject the
+Null hypothesis.
+
+
+```{r fig1cd, fig.width = 180 / 25.4, fig.height = 2}
+# Patchwork foxn1 and barcoded plot
+fig1cd <- p_foxn1_agg + theme(plot.margin = margin(0, 1, 0, 0, "cm")) +
+    p_barcoded +
+    plot_layout(widths = c(1, 3))
+fig_pdf(FIGS, fig1cd)
+```
+
+# AUCell: Mimetics
+
+Histogram of AUCs and thresholds used.
+
+```{r supp_auc_hist, fig.width = 2.6, fig.height = 4}
+auc_sce <- readRDS(file.path(ROOT, "pipeline", "integrated_universe", "sce_integrated_mimetics.rds"))
+auc_tbl <- readRDS(file.path(ROOT, "pipeline", "integrated_universe", "aucell_mimetics_tbl.rds"))
+# Make sure order is the same as for the UMAP plots
+
+auc_lvls <- forcats::fct_unify(list(factor(auc_tbl$signature), sce$signature))
+auc_lvls <- levels(auc_lvls[[1]])
+auc_tbl$signature <- forcats::fct_relevel(factor(auc_tbl$signature), levels(sce$signature))
+auc_tbl_summary <- auc_tbl %>%
+    group_by(signature, n_genes) %>%
+    summarize(above = sum(above_threshold), assigned = sum(assigned))
+
+p_auc_hist <- ggplot(auc_tbl, aes(auc)) +
+    geom_histogram(bins = 64) +
+    geom_vline(
+        data = distinct(auc_tbl, signature, n_genes, threshold),
+        aes(xintercept = threshold),
+        color = "red"
+    ) +
+    geom_text(
+        data = auc_tbl_summary,
+        hjust = 1, vjust = 1.2,
+        aes(x = Inf, y = Inf, label = sprintf("%d cells  \n(%d assigned)  ", above, assigned))
+    ) +
+    facet_wrap(~signature + n_genes, ncol = 2, labeller = labeller(
+        signature = gsub("keratinized", "kerat.", LBL_SIGNATURE),
+        n_genes = function(x) sprintf("%s genes", x),
+        .multi_line = FALSE
+    )) +
+    scale_x_continuous(limits = c(0, NA)) +
+    scale_y_continuous(expand = expansion(c(0, 0.1), 0)) +
+    labs(x = "AUC", y = "Cell count")
+p_auc_hist
+
+write.table(
+    auc_tbl[c("sample", "barcoded", "genotype", "transcriptome", "label", "signature", "auc", "threshold", "above_threshold")],
+    file.path(FIGS, "tbl_auc_hist1.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+write.table(
+    auc_tbl_summary,
+    file.path(FIGS, "tbl_auc_hist2.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+fig_pdf(FIGS, p_auc_hist)
+```
+
+
+# AUCell: Overlapping signatures
+
+```{r supp_auc_jaccard, fig.width = 3.3, fig.height = 2.4}
+p_jaccard <- plt_aucell_jaccard(auc_tbl) +
+    scale_x_discrete(labels = LBL_SIGNATURE, expand = c(0, 0)) +
+    scale_y_discrete(labels = LBL_SIGNATURE, expand = c(0, 0)) +
+    guides(fill = guide_colorbar(
+        theme = theme(legend.key.height = unit(3, "cm")),
+        title.position = "left", title.theme = element_text(hjust = 0.5, angle = 90))) +
+    theme(aspect.ratio = 1)
+p_jaccard
+write.table(
+    p_jaccard$data[c("signature.x", "signature.y", "jaccard")],
+    file.path(FIGS, "tbl_auc_jaccard.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+fig_pdf(FIGS, p_jaccard)
+```

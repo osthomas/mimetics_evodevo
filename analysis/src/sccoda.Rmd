@@ -1,0 +1,95 @@
+---
+title: Compositional analysis with scCODA
+date: "`r Sys.Date()`"
+---
+
+scCODA was run in Python.
+
+```{r setup, message = FALSE}
+library(dplyr)
+library(ggplot2)
+devtools::load_all(file.path(ROOT, "R"))
+FIGS <- file.path(ROOT, "analysis", "output", "figures", "sc")
+```
+
+Check influence of reference population on credible changes.
+
+```{r}
+sccoda <- read.csv(file.path(ROOT, "pipeline", "sccoda_summary.csv"))
+sccoda$timepoint <- gsub("C.*T.", "", sccoda$Covariate)
+sccoda$Covariate <- NULL
+
+# Keep "large population" references
+
+sccoda <- sccoda %>%
+    filter(
+        reference %in% c(
+            "early_progenitor", "postnatal_progenitor",
+            "mTEC", "cTEC", "Aire-stage", "unassigned"
+        )
+    ) %>%
+    mutate(
+        credible = Final.Parameter != 0,
+        log2.fold.change = ifelse(credible, log2.fold.change, NA)
+    ) %>%
+    group_by(Cell.Type) %>%
+    mutate(
+        times_credible = sum(credible),
+        overall_credible = (times_credible / length(unique(reference))) >= 0.5
+    )
+
+ggplot(sccoda, aes(reference, Cell.Type, fill = log2.fold.change)) +
+    geom_tile() +
+    facet_wrap(~timepoint) +
+    scale_fill_distiller(type = "div", limits = c(-7, 7)) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+```
+
+Use `unassigned` cells as the reference because changes in the population are
+small and they exist in all conditions.
+
+```{r supp_sccoda, fig.height = 3, fig.width = 1.3}
+sccoda <- sccoda %>%
+    filter(
+        reference == "unassigned",
+        Cell.Type != "unassigned",
+        Cell.Type != "cTEC_nurse"
+    ) %>%
+    mutate(
+        log2.fold.change = ifelse(!overall_credible, NA, log2.fold.change)
+    )
+
+p_sccoda <- ggplot(sccoda, aes(timepoint, Cell.Type, fill = log2.fold.change)) +
+    geom_tile() +
+    scale_x_discrete(
+        labels = c(embryo = "E16.5", newborn = "P0"),
+        expand = c(0, 0)
+    ) +
+    scale_y_discrete(
+        limits = rev(TEC_SIG_ORDER[TEC_SIG_ORDER %in% sccoda$Cell.Type]),
+        labels = LBL_SIGNATURE,
+        expand = c(0, 0)
+    ) +
+    scale_fill_distiller(
+        name = quote(log[2]*"(fold change)"),
+        type = "div",
+        limits = function(x) max(abs(x), na.rm = TRUE) * c(-1, 1)
+    ) +
+    labs(x = NULL, y = NULL) +
+    guides(fill = guide_colorbar(
+        theme = theme(legend.key.height = unit(2, "cm")),
+        title.position = "left",
+        direction = "vertical",
+        title.theme = element_text(hjust = 0.5, angle = 90)
+    )) +
+    theme(legend.position = "bottom")
+p_sccoda
+
+write.table(
+    sccoda,
+    file.path(FIGS, "tbl_sccoda.tsv"),
+    sep = "\t",
+    row.names = FALSE
+)
+fig_pdf(FIGS, p_sccoda)
+```

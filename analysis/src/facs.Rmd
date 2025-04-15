@@ -1,0 +1,405 @@
+---
+title: FACS
+date: "`r Sys.Date()`"
+---
+
+
+Plots for thymus FACS data.
+
+# Strains
+
+```{r, setup, message = FALSE}
+library(dplyr)
+library(ggplot2)
+library(geomtextpath)
+devtools::load_all(file.path(ROOT, "R"))
+FIGS <- file.path(ROOT, "analysis", "output", "figures", "facs")
+dir.create(FIGS, recursive = TRUE, showWarnings = FALSE)
+
+FACS_LBL <- list(
+    "microscope_count_total_1e6" = quote("Total cells per thymus /"~10^6),
+    tecs_1e3 = quote(TECs ~~ (Epcam^+""*CD45^-"")~"/"~10^3),
+    thymocytes_1e6 = quote(Thymocytes ~~ (CD45^+"")~"/"~10^6),
+    tec_prc_tec = quote(TECs ~~ (Epcam^+""*CD45^-"")~"/ %"),
+    "tec_prc_Ly51+UEA1-" = quote(cTECs ~~ (Ly51^+""*UEA1^-"")~"/ %"),
+    "tec_count_Ly51+UEA1-_1e3" = quote(cTECs ~~ (Ly51^+""*UEA1^-"")~"/"~10^3),
+    "tec_prc_Ly51-UEA1+" = quote(mTECs ~~ (Ly51^-""*UEA1^+"")~"/ %"),
+    "tec_count_Ly51-UEA1+_1e3" = quote(mTECs ~~ (Ly51^-""*UEA1^+"")~"/"~10^3),
+    TI = "Thymopoietic index",
+    "thymocytes_prc_cd45" = quote(CD45^+""~"/ %"),
+    "thymocytes_count_cd45_1e6" = quote(CD45^+""~"/"~10^6),
+    "thymocytes_prc_cd4sp_of_cd45" = quote(CD4^+""*CD8^-""~"(of "*CD45^+""*")" ~ "/ %"),
+    "thymocytes_count_cd4sp_1e6" = quote(CD4^+""*CD8^-""~"(of "*CD45^+""*")" ~ "/"~10^6),
+    "thymocytes_prc_cd8sp_of_cd45" = quote(CD4^-""*CD8^+""~"(of "*CD45^+""*")" ~ "/ %"),
+    "thymocytes_count_cd8sp_1e6" = quote(CD4^-""*CD8^+""~"(of "*CD45^+""*")" ~ "/"~10^6),
+    "thymocytes_prc_dp_of_cd45" = quote(CD4^+""*CD8^+""~"(of "*CD45^+""*")" ~ "/ %"),
+    "thymocytes_count_dp_1e6" = quote(CD4^+""*CD8^+""~"(of "*CD45^+""*")" ~ "/"~10^6),
+    "thymocytes_prc_dn_of_cd45" = quote("DN (of "*CD45^+""*") / %"),
+    "thymocytes_prc_tcrb_of_dn" = quote("TCR"*beta^+""~"(of DN) / %"),
+    "thymocytes_count_tcrb_1e6" = quote("TCR"*beta^+""~"(of DN) /"~10^6),
+    "thymocytes_prc_cd19_of_dn" = quote(CD19^+""~"(of DN) / %"),
+    "thymocytes_count_cd19_1e6" = quote(CD19^+""~"(of DN) /"~10^6)
+)
+```
+
+
+```{r prepare-data}
+dat <- as_tibble(read.csv(
+    file.path(ROOT, "data", "facs", "facs.tsv"),
+    sep = "\t",
+    check.names = FALSE
+))
+
+dat$tecs <- dat[["tec_count_tec"]]
+dat$thymocytes <- dat[["thymocytes_count_cd45"]]
+dat$ctecs <- dat[["tec_count_Ly51+UEA1-"]]
+dat$mtecs <- dat[["tec_count_Ly51-UEA1+"]]
+dat$microscope_count_total_1e6 <- dat$microscope_count_total / 1e6
+dat$tecs_1e3 <- dat$tecs / 1e3
+dat$thymocytes_1e6 <- dat$thymocytes / 1e6
+dat$`tec_count_Ly51+UEA1-_1e3` <- dat$`tec_count_Ly51+UEA1-` / 1e3
+dat$`tec_count_Ly51-UEA1+_1e3` <- dat$`tec_count_Ly51-UEA1+` / 1e3
+dat$`thymocytes_count_cd45_1e6` <- dat$`thymocytes_count_cd45` / 1e6
+dat$`thymocytes_count_cd4sp_1e6` <- dat$`thymocytes_count_cd4sp` / 1e6
+dat$`thymocytes_count_cd8sp_1e6` <- dat$`thymocytes_count_cd8sp` / 1e6
+dat$`thymocytes_count_dp_1e6` <- dat$`thymocytes_count_dp` / 1e6
+dat$thymocytes_count_tcrb_1e6 <- dat$thymocytes_count_tcrb / 1e6
+dat$thymocytes_count_cd19_1e6 <- dat$thymocytes_count_cd19 / 1e6
+```
+
+
+```{r}
+#' Check if a character vector is in a list
+#' @param x character
+#' @param l list of character vectors
+combination_in <- function(x, l) {
+    x <- as.character(x)
+    x <- paste(sort(x), collapse = "-")
+    l <- lapply(l, function(x) paste(sort(x), collapse = "-"))
+    x %in% l
+}
+
+#' Perform multiple ANOVAs, correct their overall p values, and then correct p
+#' values from pairwise comparisons for all tests in which the overall p was
+#' significant.
+#' @param data Input data
+#' @param columns columns to run ANOVAs on (dependent variables; independent
+#'        variable is always "strain")
+#' @param comparisons list of character vectors of length 2
+#'      Specify pairwise comparisons to test. If NULL, test all.
+multi_anovas <- function(data, columns, comparisons = NULL) {
+    res <- vector("list", length(columns))
+    names(res) <- columns
+    for (col_ in columns) {
+        formula <- as.formula(sprintf("`%s` ~ strain", col_))
+        res_aov <- aov(formula, data = data)
+        ts <- pairwise.t.test(
+            data[[col_]], data[["strain"]],
+            var.equal = FALSE,
+            p.adjust = "none"
+        )
+        ts <- broom::tidy(ts)
+        if (!is.null(comparisons)) {
+            ts <- ts %>%
+                rowwise() %>%
+                filter(combination_in(c(group1, group2), comparisons))
+        }
+        ts$p.adj <- p.adjust(ts$p.value, method = "bonf")
+        res[[col_]] <- ts
+        res[[col_]]$column <- col_
+        res_omni <- data.frame(
+            group1 = "omnibus", group2 = "omnibus", column = col_,
+            aov_p = summary(res_aov)[[1]][["Pr(>F)"]][1],
+            aov_F = summary(res_aov)[[1]][["F value"]][1],
+            aov_df1 = summary(res_aov)[[1]][["Df"]][1],
+            aov_df2 = summary(res_aov)[[1]][["Df"]][2]
+        )
+        res[[col_]]$aov_p <- res_omni$aov_p
+        res[[col_]]$aov_F <- res_omni$aov_F
+        res[[col_]] <- bind_rows(res[[col_]], res_omni)
+    }
+    # correct multiple ANOVAs
+    res <- bind_rows(res)
+    aov_ps <- filter(res, group1 == "omnibus") %>% distinct(column, aov_p)
+    aov_ps$aov_p.adj <- p.adjust(aov_ps$aov_p, method = "bonf")
+    res <- left_join(res, aov_ps)
+    res$p.value <- ifelse(res$aov_p.adj > 0.05, NA, res$p.value)
+    res$p.adj <- ifelse(res$aov_p.adj > 0.05, NA, res$p.adj)
+    res
+}
+
+
+#' Plot one column of the FACS data with associated p values (ANOVA, corrected)
+#' @param dat Data to plot
+#' @param columns chr, columns to plot - one plot per column
+#' @param pairwise logical, whether to show pairwise_p values
+#' @param comparisons list of character vectors of length 2
+#'      Specify pairwise comparisons to test. If NULL, test all.
+plt_facs <- function(dat, columns, pairwise_p, comparisons = NULL) {
+    pvals <- multi_anovas(dat, columns, comparisons)
+    pvals_omni <- filter(pvals, group1 == "omnibus")
+    pvals <- filter(pvals, group1 != "omnibus") %>%
+        mutate(
+            group1 = factor(group1, levels = levels(dat$strain)),
+            group2 = factor(group2, levels = levels(dat$strain))
+        ) %>%
+        rowwise() %>%
+        mutate(
+            start = min(as.numeric(group1), as.numeric(group2)),
+            length = abs(diff(range(c(as.numeric(group1), as.numeric(group2)))))
+        ) %>%
+        group_by(column) %>%
+        mutate(
+            order = order(order(start, length)),
+            mult = 1 + order / 6
+        )
+
+    out <- lapply(columns, function(col_) {
+        max_y <- max(dat[[col_]], na.rm = TRUE)
+        aov_p <- filter(pvals, column == col_)
+        omnibus <- filter(pvals_omni, column == col_)
+        omnibus_p <- pval_fmt(omnibus$aov_p.adj, exact = TRUE)[[1]]
+        aov_F <- omnibus$aov_F
+        df1 <- omnibus$aov_df1
+        df2 <- omnibus$aov_df2
+        p <- ggplot(dat, aes(x = strain, y = .data[[col_]])) +
+            # Data
+            geom_boxplot(outlier.shape = NA) +
+            geom_point(position = position_jitter(height = 0, width = 0.1)) +
+            # sample size
+            geom_text(
+                stat = "summary",
+                vjust = 1.5,
+                fun.data = function(x) {
+                    data.frame(y = 0, label = sprintf("n = %d", length(x)))
+                }
+            )
+        # p values
+        if (pairwise_p) {
+            p <- p +
+                geom_segment(
+                    data = aov_p,
+                    aes(x = group1, xend = group2,
+                        y = max_y * mult, yend = stage(1, after_scale(y)))
+                ) +
+                geom_textsegment(
+                    data = aov_p, parse = TRUE, linetype = NA,
+                    aes(x = group1, xend = group2,
+                        y = max_y * (mult + 0.07), yend = stage(1, after_scale(y)),
+                        label = pval_fmt(p.adj, exact = TRUE)))
+        }
+        p <- p +
+            scale_y_continuous(limits = c(0, NA), expand = expansion(c(0.1, 0.05), c(0, 0))) +
+            labs(
+                title = parse(text = paste("'ANOVA: '", omnibus_p, sep = "*")),
+                subtitle = sprintf("F(%d,%d) = %.2f", df1, df2, aov_F),
+                x = NULL, y = FACS_LBL[[col_]]
+            ) +
+            theme(
+                plot.title = element_text(hjust = 0, size = rel(1)),
+                plot.subtitle = element_text(hjust = 0, size = rel(0.7)),
+            )
+    })
+    names(out) <- columns
+    out
+}
+```
+
+```{r dat-strains}
+dat_strains <- filter(dat, age_wk >= 6, genotype == "wt", strain %in% c("B6", "PWK", "CBA"))
+dat_strains$strain <- factor(dat_strains$strain, levels = c("B6", "PWK", "CBA"))
+stopifnot(nrow(dat_strains) == 28)
+write.table(dat_strains, file.path(FIGS, "tbl_facs_strains.tsv"), sep = "\t", row.names = FALSE)
+
+strains_cols <- c("tecs_1e3", "thymocytes_1e6")
+ps_strains <- plt_facs(dat_strains, strains_cols, pairwise_p = TRUE)
+```
+
+```{r ps_strains, fig.width = 1.7, fig.height = 2}
+ps_strains
+invisible(lapply(names(ps_strains), function(col) {
+    fig_pdf(FIGS, ps_strains[[col]], paste("fig_facs_strains", col, sep = "_"))
+}))
+```
+
+
+# Backcross Data
+
+```{r fig_back_base, fig.width = 3.5, fig.height = 2}
+dat_back <- filter(dat, grepl("(PWK)|(CBA)", strain))
+dat_back$strain <- factor(dat_back$strain, levels = c(
+    "CBA", "PWK",
+    "PWK x CBA",
+    "CBA x PWK/CBA",
+    "PWK x PWK/CBA"
+))
+stopifnot(nrow(dat_back) == 104)
+write.table(dat_back, file.path(FIGS, "tbl_facs_back.tsv"), sep = "\t", row.names = FALSE)
+
+back_cols <- c(
+    "tec_prc_tec",
+    "tecs_1e3",
+    "tec_prc_Ly51+UEA1-",
+    "tec_count_Ly51+UEA1-_1e3",
+    "tec_prc_Ly51-UEA1+",
+    "tec_count_Ly51-UEA1+_1e3",
+    "TI",
+    "thymocytes_prc_cd45",
+    "thymocytes_count_cd45_1e6",
+    "thymocytes_prc_cd4sp_of_cd45",
+    "thymocytes_count_cd4sp_1e6",
+    "thymocytes_prc_cd8sp_of_cd45",
+    "thymocytes_count_cd8sp_1e6",
+    "thymocytes_prc_dp_of_cd45",
+    "thymocytes_count_dp_1e6"
+)
+
+ps_back <- plt_facs(
+    dat_back,
+    back_cols,
+    pairwise_p = TRUE,
+    comparisons = list(c("CBA x PWK/CBA", "PWK x PWK/CBA"))
+)
+# some minor adjustment to backcross plots
+ps_back <- lapply(ps_back, function(p) {
+    p <- p +
+        facet_grid(~generation, scales = "free_x", space = "free") +
+        scale_x_discrete(labels = function(x) gsub(" x ", "\nx\n", x))
+    # HACK: show p values only in "F2" panel
+    p$layers[[4]]$data$generation <- "F2"
+    p$layers[[5]]$data$generation <- "F2"
+    p
+})
+
+# Post process specific plots
+
+# no dotplot
+ps_back[["thymocytes_prc_cd45"]]$layers[[1]]$geom_params$outlier.shape <- 19
+ps_back[["thymocytes_prc_cd45"]]$layers[[2]] <- NULL
+```
+
+
+```{r ps_back, opts.label = "fig_back_base"}
+ps_back
+invisible(lapply(names(ps_back), function(col) {
+    fig_pdf(FIGS, ps_back[[col]], paste("fig_facs_back", col, sep = "_"))
+}))
+```
+
+
+# Chimera6 Data
+
+```{r dat-chi6}
+dat_chi6 <- dat %>%
+    filter(strain  %in% c("FVB", "chi6.up", "chi6.down")) %>%
+    mutate(strain = factor(strain, levels = c("FVB", "chi6.down", "chi6.up")))
+stopifnot(nrow(dat_chi6) == 36)
+write.table(dat_chi6, file.path(FIGS, "tbl_facs_chi6.tsv"), sep = "\t", row.names = FALSE)
+
+chi6_cols <- c(
+    "thymocytes_count_dp_1e6",
+    "thymocytes_prc_dp_of_cd45",
+    "thymocytes_prc_cd19_of_dn",
+    "thymocytes_prc_cd4sp_of_cd45",
+    "thymocytes_prc_cd8sp_of_cd45",
+    "thymocytes_prc_tcrb_of_dn",
+    "thymocytes_prc_dn_of_cd45"
+)
+ps_chi6 <- plt_facs(dat_chi6, chi6_cols, pairwise_p = TRUE)
+ps_chi6 <- lapply(ps_chi6, function(p) {
+    p$layers[[1]]$mapping <- aes(color = strain)
+    p$layers[[2]]$mapping <- aes(color = strain)
+    p +
+        scale_x_discrete(labels = LBL_GROUP) +
+        scale_color_manual(values = COL_CHI6) +
+        theme(legend.position = "none")
+})
+# Combine plots of percentages for EDF6
+ps_chi6_prc <- ps_chi6[grepl("_prc_", names(ps_chi6))]
+p_chi6_ncol <- 3
+for (i in seq_along(ps_chi6_prc)) {
+    is_left <- i %% p_chi6_ncol == 1
+    is_top <- i <= p_chi6_ncol
+    m <- c(t = 5, r = 0, b = 0, l = 5)
+    if (is_left) m["l"] <- 0
+    if (is_top) m["t"] <- 0
+    ps_chi6_prc[[i]] <- ps_chi6_prc[[i]] + theme(plot.margin = unit(m, "mm"))
+}
+ps_chi6_prc <- patchwork::wrap_plots(ps_chi6_prc, ncol = p_chi6_ncol)
+```
+
+
+```{r fig_facs_chi6_prc, fig.width = 8, fig.height = 4}
+ps_chi6_prc
+fig_pdf(FIGS, ps_chi6_prc)
+```
+
+```{r fig_facs_chi6_thymocytes_count_dp_1e6, fig.width = 2.5, fig.height = 2}
+ps_chi6[["thymocytes_count_dp_1e6"]]
+fig_pdf(FIGS, ps_chi6[["thymocytes_count_dp_1e6"]])
+```
+
+
+# Ly51/UEA1 ratio
+
+```{r fig_ratio_ly51uea1, fig.width = 3, fig.height = 2}
+dat_lur <- read.csv(file.path(ROOT, "data", "facs", "ly51uea1_ratio.tsv"), sep = "\t")
+dat_lur$log2lur <- log2(dat_lur$ly51uea1_ratio)
+
+loess_cv <- function(formula, dat, spans, k) {
+    folds <- sample(x = seq_len(k), size = nrow(dat_lur), replace = TRUE)
+    mse_mat <- matrix(nrow = length(spans), ncol = k)
+    lhs <- as.character(rlang::f_lhs(formula))
+    for (i in seq_along(spans)) {
+        span <- spans[i]
+        for (j in seq_len(k)) {
+            loess_fit <- stats::loess(formula, data = dat[folds != j, ], span = span)
+            pred_dat <- dat[folds == j, ]
+            loess_pred <- predict(loess_fit, newdata = pred_dat)
+            mse <- mean((loess_pred - pred_dat[[lhs]])^2, na.rm = TRUE)
+            mse_mat[i, j] <- mse
+        }
+    }
+    cv_errors <- rowMeans(mse_mat)
+    span <- spans[which.min(cv_errors)]
+    span
+}
+set.seed(1)
+span <- loess_cv(log2lur ~ age_d, dat_lur, spans = seq(0.4 , 0.9, by = 0.01), k = 10)
+
+# Fit model with  determined span
+loess_fit <- stats::loess(log2lur ~ age_d, span = span, data = dat_lur)
+loess_x <- seq(0, 365, by = 0.1)
+loess_pred <- predict(loess_fit, newdata = data.frame(age_d = loess_x))
+
+p_lur <- ggplot(dat_lur, aes(age_d, log2lur)) +
+    geom_hline(yintercept = 0, lty = "dashed") +
+    geom_vline(xintercept = 0, lty = "dashed") +
+    annotate(
+        geom = "segment",
+        x = loess_x[which.min(loess_pred)],
+        y = -Inf, yend = loess_pred[which.min(loess_pred)]
+    ) +
+    geom_smooth(method = loess, n = 365, method.args = list(span = span), color = "gray50") +
+    geom_point() +
+    scale_x_continuous(
+        breaks = c(0, 28, 100, 200, 300, 365),
+        labels = function(x) {
+            res <- rep(NA, length(x))
+            res[x < 0] <- paste0("E", 20 + x)
+            res[x >= 0] <- round(x)
+            res
+        }
+    ) +
+    labs(
+        x = "Age / days",
+        y = quote(log[2]*"(% Ly51"^+""*" / % UEA1"^+""*")")
+    )
+p_lur
+
+
+write.table(
+    dat_lur[c("age_d", "ly51uea1_ratio", "log2lur")],
+    file.path(FIGS, "tbl_facs_lur.tsv"), sep = "\t", row.names = FALSE)
+fig_pdf(FIGS, p_lur)
+```
